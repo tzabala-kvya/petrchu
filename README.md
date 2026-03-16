@@ -74,7 +74,14 @@ petrchu/
 ### Prerequisites
 - Arduino IDE 2.x (or PlatformIO)
 - Python 3.x on the Raspberry Pi
-- Required Arduino libraries: (list TBD)
+
+### Required Arduino Libraries
+Install these through the Arduino IDE Library Manager (Sketch → Include Library → Manage Libraries), 
+or clone from GitHub into your Arduino/libraries/ folder:
+
+| Library | Source | Used For |
+|---------|--------|----------|
+| BlueRobotics MS5837 | [GitHub](https://github.com/bluerobotics/BlueRobotics_MS5837_Library) | MS5837-02BA water pressure sensor (I2C) |
 
 ### Upload Firmware
 ```bash

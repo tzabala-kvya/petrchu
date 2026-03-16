@@ -1,0 +1,55 @@
+# ============================================
+# PetrChu .gitignore
+# Hybrid CAES + Pumped Hydro Energy Storage
+# ============================================
+
+# --- Compiled Arduino output ---
+*.elf
+*.hex
+*.bin
+*.o
+*.d
+build/
+
+# --- IDE / editor files ---
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Large CAD files (use Git LFS or link to shared drive) ---
+*.stl
+*.step
+*.stp
+*.SLDPRT
+*.SLDASM
+*.SLDDRW
+
+# --- Credentials / secrets ---
+# NEVER commit passwords, API keys, or WiFi creds
+credentials.h
+wifi_config.h
+secrets.py
+
+# --- Data files that are too large for Git ---
+# Keep test data small or use .gitkeep in the folder
+# and store large datasets externally
+*.csv.bak
+*.log
+
+# --- Temporary files ---
+*.tmp
+*.bak

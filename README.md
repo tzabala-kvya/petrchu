@@ -105,9 +105,9 @@ See [`docs/design-decisions/`](docs/design-decisions/) for detailed write-ups on
 | Tristan | Controls & Electrical |
 | Brennan | CAES Subsystem |
 | Philip | Pumped Hydro Subsystem |
-| Jasmine | Alternator & Powertrain |
-| Derek | Frame & Chassis |
-| Ethan | Frame & Chassis |
+| Jasmine | Alternator |
+| Derek | Alternator |
+| Ethan | Clutching System|
 
 **Sponsor:** Abdelrahman Elmaradny
 

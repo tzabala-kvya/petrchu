@@ -1,0 +1,33 @@
+{
+  "words": [
+    "MOSFET", "MOSFETs", "solenoid", "solenoids",
+    "EEPROM", "contactor", "contactors",
+    "alternator", "compressor",
+    "hydrostatic", "ratiometric",
+    "transducer", "transducers",
+    "overpressure", "undervoltage", "overcurrent",
+    "brownout", "brownouts",
+    "debounce", "debouncing",
+    "telemetry", "heartbeat",
+    "superloop", "bitfield", "bitmap",
+    "interlock", "interlocks",
+    "pullup", "pullups",
+    "millis", "micros",
+    "uint8", "uint16", "uint32", "int16",
+    "Arduino", "Mega", "ATmega",
+    "Raspberry", "Tkinter", "matplotlib",
+    "Tailscale", "WinSCP",
+    "Simscape", "Simulink", "MATLAB",
+    "datasheet", "datasheets",
+    "psi", "mbar",
+    "RPM", "RPMs",
+    "PWM", "ADC", "ISR", "ISRs",
+    "GPIO", "SDA", "SCL",
+    "UART", "baud",
+    "JSON", "CSV",
+    "encoders", "potentiometer",
+    "petrchu", "teststand", "DISCH", 
+    "XDUCR", "jstr", "jnum",
+    "vpaa", "vpwa", "WDTO"
+  ]
+}

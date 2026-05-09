@@ -24,6 +24,7 @@
 #include <Wire.h>
 #include <avr/wdt.h>   // hardware watchdog — resets the Mega if our loop ever freezes
 #include <EEPROM.h>    // saves calibration offset so it survives power cycles
+#include "MS5837.h"    // BlueRobotics MS5837 library for hydrostatic pressure sensor
 
 // ========================================================================
 // 1. CONFIGURATION — this is where most of my changes will happen
@@ -47,21 +48,17 @@ static const uint16_t PI_HEARTBEAT_TIMEOUT_MS = 2000;  // if Pi goes silent for 
 // >>> or worse, a solenoid opening when it shouldn't.
 
 // --- Digital outputs (MOSFET gate drivers) ---
-// Each of these drives a MOSFET that switches a valve/solenoid/contactor.
-// HIGH = MOSFET on = valve open / solenoid energized.
+// Each MOSFET drives a contactor coil or solenoid.
+// HIGH = MOSFET on = contactor/solenoid energized.
 // >>> DECIDE: are these active-HIGH or active-LOW for my MOSFET drivers?
 // >>>         If active-LOW, I need to flip the logic in write_pin().
-static const uint8_t PIN_VALVE_CHARGE_AIR   = 22;  // opens air-side charge path
-static const uint8_t PIN_VALVE_CHARGE_WATER = 23;  // opens water-side charge path
-static const uint8_t PIN_VALVE_DISCH_AIR    = 24;  // opens air-side discharge to wheel
-static const uint8_t PIN_VALVE_DISCH_WATER  = 25;  // opens water-side discharge to wheel
-static const uint8_t PIN_SOLENOID_AIR       = 26;  // air-side on/off solenoid
-static const uint8_t PIN_SOLENOID_WATER     = 27;  // water-side on/off solenoid
-static const uint8_t PIN_SOLENOID_VENT      = 28;  // vents pressure to atmosphere (safety)
-static const uint8_t PIN_MAIN_CONTACTOR     = 29;  // master power relay to all actuators
-static const uint8_t PIN_STATUS_LED_GREEN   = 13;  // onboard LED works, easy for testing
-static const uint8_t PIN_STATUS_LED_RED     = 12;
-static const uint8_t PIN_BUZZER             = 11;  // audible alarm on fault/estop
+static const uint8_t PIN_COMPRESSOR_CONT  = 22;  // MOSFET → contactor coil → compressor runs → charges air vessel
+static const uint8_t PIN_PUMP_CONT        = 23;  // MOSFET → contactor coil → pump runs → charges water side
+static const uint8_t PIN_DISCH_SOL_AIR    = 24;  // solenoid valve — opens air discharge to wheel
+static const uint8_t PIN_DISCH_SOL_WATER  = 25;  // solenoid valve — opens water discharge to wheel
+static const uint8_t PIN_STATUS_LED_GREEN = 13;  // onboard LED works, easy for testing
+static const uint8_t PIN_STATUS_LED_RED   = 12;
+static const uint8_t PIN_BUZZER           = 11;  // audible alarm on fault/estop
 
 // --- Servo / variable valve PWM ---
 // These drive servos (or stepper drivers) that control variable flow valves.
@@ -104,7 +101,6 @@ static const uint8_t PIN_VALVE_ENC_WATER = A9;  // encoder/pot feedback from wat
 // SDA = pin 20, SCL = pin 21 (hardwired on Mega, can't change these).
 // >>> IMPORTANT: MS5837-02BA is a 3.3V device. Mega is 5V.
 // >>> I NEED a level shifter between them or the sensor will fry.
-static const uint8_t I2C_ADDR_MS5837 = 0x76;
 
 // ========================================================================
 // SAFETY THRESHOLDS
@@ -426,14 +422,10 @@ static inline void write_pin(uint8_t pin, bool on) {
 // Emergency shutdown — called from E-stop ISR and whenever we enter FAULT.
 // This is the "oh shit" function. Every actuator goes off immediately.
 void immediate_cutoff_all() {
-    digitalWrite(PIN_VALVE_CHARGE_AIR, LOW);
-    digitalWrite(PIN_VALVE_CHARGE_WATER, LOW);
-    digitalWrite(PIN_VALVE_DISCH_AIR, LOW);
-    digitalWrite(PIN_VALVE_DISCH_WATER, LOW);
-    digitalWrite(PIN_SOLENOID_AIR, LOW);
-    digitalWrite(PIN_SOLENOID_WATER, LOW);
-    digitalWrite(PIN_SOLENOID_VENT, LOW);
-    digitalWrite(PIN_MAIN_CONTACTOR, LOW);
+    digitalWrite(PIN_COMPRESSOR_CONT, LOW);
+    digitalWrite(PIN_PUMP_CONT, LOW);
+    digitalWrite(PIN_DISCH_SOL_AIR, LOW);
+    digitalWrite(PIN_DISCH_SOL_WATER, LOW);
     g_outputs_bitmap = 0;
 }
 
@@ -480,35 +472,31 @@ static float lowpass(float prev, float x, float a) {
 }
 
 // ========================================================================
-// 7. MS5837-02BA DRIVER (STUB)
+// 7. MS5837-02BA DRIVER (BlueRobotics library)
 // ========================================================================
-// >>> TODO: Replace this entire section with the real driver.
-// >>>       Drop ms5837_driver.h into this folder and add:
-// >>>       #include "ms5837_driver.h"
-// >>>       at the top of this file. Then delete from here to section 8.
-// >>>
-// >>>       The real driver needs the Blue Robotics MS5837 library installed
-// >>>       in Arduino IDE (Library Manager → search "MS5837").
+// Uses the BlueRobotics MS5837 library.
+// Install via Arduino IDE: Library Manager → search "MS5837"
+// >>> IMPORTANT: MS5837-02BA is a 3.3V device. Mega is 5V.
+// >>> I NEED a level shifter between them or the sensor will fry.
 
+static MS5837 g_ms5837;
 static bool g_ms5837_ok = false;
 
 bool ms5837_init() {
-    Wire.beginTransmission(I2C_ADDR_MS5837);
-    Wire.write(0x1E);  // reset command
-    if (Wire.endTransmission() != 0) return false;
-    delay(10);
+    if (!g_ms5837.init()) return false;
+    g_ms5837.setModel(MS5837::MS5837_02BA);
+    g_ms5837.setFluidDensity(997);  // freshwater kg/m^3 (use 1029 for seawater)
     g_ms5837_ok = true;
     return true;
 }
 
 bool ms5837_read(float &mbar, float &temp) {
     if (!g_ms5837_ok) return false;
-    Wire.beginTransmission(I2C_ADDR_MS5837);
-    if (Wire.endTransmission() != 0) return false;
-    // PLACEHOLDER — returns a fake value so the rest of the code compiles.
-    // The real driver does a ~20ms conversion and returns actual data.
-    mbar = 1013.25f;
-    temp = 22.1f;
+    g_ms5837.read();
+    mbar = g_ms5837.pressure();     // returns mbar
+    temp = g_ms5837.temperature();  // returns degrees C
+    // Sanity check — if read failed the values will be wildly off
+    if (mbar < 0.0f || mbar > 2000.0f) return false;
     return true;
 }
 
@@ -836,47 +824,39 @@ void commit_outputs() {
     uint8_t out = 0;
 
     // Bit positions in the output bitmap — must match what the Pi expects
-    #define BIT_VCA  (1<<0)  // valve charge air
-    #define BIT_VCW  (1<<1)  // valve charge water
-    #define BIT_VDA  (1<<2)  // valve discharge air
-    #define BIT_VDW  (1<<3)  // valve discharge water
-    #define BIT_VENT (1<<4)  // vent solenoid
-    #define BIT_CONT (1<<5)  // main contactor
-    #define BIT_SA   (1<<6)  // solenoid air
-    #define BIT_SW   (1<<7)  // solenoid water
+    #define BIT_COMP (1<<0)  // compressor contactor (charges air vessel)
+    #define BIT_PUMP (1<<1)  // pump contactor (charges water side)
+    #define BIT_DSA  (1<<2)  // discharge solenoid air (releases air to wheel)
+    #define BIT_DSW  (1<<3)  // discharge solenoid water (releases water to wheel)
 
     // Set outputs based on current state
     switch (g_state) {
     case S_ARM:
-        out = BIT_CONT;  // contactor on, everything else off
+        out = 0;  // armed but nothing running yet
         break;
     case S_CHARGE:
-        out = BIT_CONT;
-        if (g_cmd.charge_air)   out |= BIT_VCA | BIT_SA;  // open air charge path
-        if (g_cmd.charge_water) out |= BIT_VCW | BIT_SW;  // open water charge path
+        if (g_cmd.charge_air)   out |= BIT_COMP;  // run compressor
+        if (g_cmd.charge_water) out |= BIT_PUMP;   // run pump
         break;
     case S_READY:
-        out = BIT_CONT;  // contactor stays on, valves closed, holding pressure
+        out = 0;  // charged, everything off, holding pressure
         break;
     case S_DISCHARGE_AIR:
-        out = BIT_CONT | BIT_VDA | BIT_SA;
+        out = BIT_DSA;
         break;
     case S_DISCHARGE_WATER:
-        out = BIT_CONT | BIT_VDW | BIT_SW;
+        out = BIT_DSW;
         break;
     case S_DISCHARGE_BOTH:
-        out = BIT_CONT | BIT_VDA | BIT_VDW | BIT_SA | BIT_SW;
+        out = BIT_DSA | BIT_DSW;
         break;
     case S_MANUAL_DIAG:
         // In manual mode, the Pi directly controls which outputs are on.
-        // This is for bench testing individual valves/solenoids.
+        // This is for bench testing individual outputs.
         out = (g_cmd.manual_io_value & g_cmd.manual_io_mask);
         break;
-    case S_SHUTDOWN:
-        out = BIT_VENT;  // open vent to release pressure safely
-        break;
     default:
-        out = 0;  // OFF, FAULT, ESTOP, CAL states — everything off
+        out = 0;  // OFF, SHUTDOWN, FAULT, ESTOP, CAL states — everything off
         break;
     }
 
@@ -884,35 +864,31 @@ void commit_outputs() {
     // HARD INTERLOCKS — these override EVERYTHING
     // ==========================================
 
-    // Overpressure: immediately close charge valves and force vent open
+    // Overpressure: immediately stop charging (compressor/pump off)
+    // The mechanical pressure relief valve handles the actual venting.
     if (g_sen.p_line_psi > P_MAX_PSI) {
-        out &= ~(BIT_VCA | BIT_VCW);  // block charge
-        out |= BIT_VENT;              // force vent
+        out &= ~(BIT_COMP | BIT_PUMP);
     }
 
-    // Arm switch off: kill all valves and solenoids (contactor too)
+    // Arm switch off: kill everything
     // Exception: MANUAL mode ignores arm switch (for bench testing)
     if (!g_in.arm_switch_on && g_state != S_MANUAL_DIAG) {
-        out &= ~(BIT_VCA | BIT_VCW | BIT_VDA | BIT_VDW | BIT_SA | BIT_SW);
+        out = 0;
     }
 
     // MUTUAL EXCLUSION: never charge and discharge the same fluid at the same time.
     // This prevents pressurizing against an open discharge (could overspeed the wheel
     // or create a water hammer situation).
-    if (out & BIT_VDA) out &= ~BIT_VCA;  // if discharging air, don't charge air
-    if (out & BIT_VDW) out &= ~BIT_VCW;  // if discharging water, don't charge water
+    if (out & BIT_DSA) out &= ~BIT_COMP;  // if discharging air, don't run compressor
+    if (out & BIT_DSW) out &= ~BIT_PUMP;  // if discharging water, don't run pump
 
     // ==========================================
     // Write to actual pins
     // ==========================================
-    write_pin(PIN_VALVE_CHARGE_AIR,   out & BIT_VCA);
-    write_pin(PIN_VALVE_CHARGE_WATER, out & BIT_VCW);
-    write_pin(PIN_VALVE_DISCH_AIR,    out & BIT_VDA);
-    write_pin(PIN_VALVE_DISCH_WATER,  out & BIT_VDW);
-    write_pin(PIN_SOLENOID_AIR,       out & BIT_SA);
-    write_pin(PIN_SOLENOID_WATER,     out & BIT_SW);
-    write_pin(PIN_SOLENOID_VENT,      out & BIT_VENT);
-    write_pin(PIN_MAIN_CONTACTOR,     out & BIT_CONT);
+    write_pin(PIN_COMPRESSOR_CONT, out & BIT_COMP);
+    write_pin(PIN_PUMP_CONT,       out & BIT_PUMP);
+    write_pin(PIN_DISCH_SOL_AIR,   out & BIT_DSA);
+    write_pin(PIN_DISCH_SOL_WATER, out & BIT_DSW);
 
     g_outputs_bitmap = out;  // save for telemetry
 }
@@ -1094,10 +1070,8 @@ bool run_selftest() {
 void setup() {
     // --- Configure all output pins ---
     uint8_t outs[] = {
-        PIN_VALVE_CHARGE_AIR, PIN_VALVE_CHARGE_WATER,
-        PIN_VALVE_DISCH_AIR, PIN_VALVE_DISCH_WATER,
-        PIN_SOLENOID_AIR, PIN_SOLENOID_WATER,
-        PIN_SOLENOID_VENT, PIN_MAIN_CONTACTOR,
+        PIN_COMPRESSOR_CONT, PIN_PUMP_CONT,
+        PIN_DISCH_SOL_AIR, PIN_DISCH_SOL_WATER,
         PIN_STATUS_LED_GREEN, PIN_STATUS_LED_RED, PIN_BUZZER,
         PIN_VALVE_SERVO_AIR, PIN_VALVE_SERVO_WATER
     };

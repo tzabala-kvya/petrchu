@@ -11,7 +11,8 @@
 //   A   (Yellow) -> i just D2  (INT0)
 //   B   (White)  -> D4  (any digital input)
 //   Z   (G/B)    -> D3  (INT1, index pulse — one per revolution)
-//
+// 
+//  Open Serial Monitor at 115200 Baud
 //
 // Decoding: x1 quadrature (count rising edges of A, direction from B).
 // Uno only has 2 hardware interrupts, so we use one for A and one for Z.

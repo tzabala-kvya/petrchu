@@ -1,52 +1,67 @@
 // ============================================================================
-// PetrChu — SCT-013-000 AC current sensor test (Arduino Uno)
+// PetrChu — SCT-013-030 AC current sensor test (Arduino Uno)
 // ----------------------------------------------------------------------------
-// SCT-013-000 is a non-invasive split-core current transformer (CT).
-// The "-000" variant outputs CURRENT (not voltage), so it needs an external
-// burden resistor to develop a measurable voltage. Other variants in the
-// SCT-013 family (e.g. -030) include an internal burden and output 1 V RMS
-// at full scale — those don't need this circuit.
+// Companion to current_sensor_test_uno/ (the SCT-013-000 version). Use this
+// sketch only if the sensor turns out to be the -030 variant, NOT the -000.
 //
-// SENSOR SPECS:
-//   Primary range : 0-100 A AC (RMS)
-//   Turns ratio   : 2000:1 (so 100 A primary -> 50 mA secondary)
-//   Output type   : current (external burden required)
+// How to tell which you have:
+//   - The suffix on the casing label is authoritative. "-000" = current
+//     output (needs external burden); "-030" = voltage output (internal
+//     burden, 1 V RMS at 30 A primary). A label that says "SCT-013-000 30A"
+//     is still a -000 — the "30A" is just the recommended max primary.
+//   - Quick bench check: with no external burden and the CT clamped around
+//     a small known AC load (e.g. 2-5 A), measure ACV across the plug. A
+//     -030 will show a sensible voltage proportional to current. A -000
+//     will show a wildly high open-circuit voltage — disconnect immediately
+//     and use the -000 sketch with a burden resistor instead.
 //
-// WIRING (3.5mm jack on the sensor; tip + sleeve are the two CT leads):
+// SENSOR SPECS (-030):
+//   Primary range : 0-30 A AC (RMS)
+//   Output        : 0-1 V RMS, linear (1 V RMS == 30 A primary)
+//   Output type   : voltage (internal burden — DO NOT add an external one)
+//
+// WIRING (3.5mm jack on the sensor; tip + sleeve are the two output leads):
 //
 //                +5V
 //                 |
 //                [10k]            <- bias divider top
 //                 |
-//   TIP    ---+---o A0 o---+---  SLEEVE
-//             |            |
-//           [110R]        [10k]   <- bias divider bottom (100R + 10R series)
-//             |            |
-//             +-----+------+
-//                   |
-//                 [10uF]           <- bias-decoupling cap (recommended)
-//                   |
-//                  GND
+//   SLEEVE ------+                <- bias node, ~2.5V
+//                 |
+//                [10uF]           <- (optional) bias-decoupling cap
+//                 |
+//                [10k]            <- bias divider bottom
+//                 |
+//                GND
+//
+//   TIP    ------------- A0      <- signal lead direct to Uno A0
+//
+//   IMPORTANT: TIP and SLEEVE go to DIFFERENT nodes. Do not tie them
+//   together — that shorts the sensor's internal burden and you'll
+//   read exactly 0 A. A0 is biased to ~2.5V through the CT's own
+//   winding; the AC signal then rides on top of that bias.
+//
+//   ALSO: clamp around ONE conductor only (hot OR neutral). Clamping
+//   the whole 2-wire cord makes the opposing currents cancel and the
+//   reading sits at zero.
 //
 // NOTES:
 //   - The two 10k resistors bias A0 to ~Vcc/2 so the AC waveform sits in the
 //     middle of the ADC range (the ADC cannot read negative voltages).
-//   - The 110R BURDEN converts secondary current into a voltage at A0:
-//       V_burden_peak = I_sec_peak * R_burden
-//     At 30 A primary RMS: I_sec = 15 mA RMS = 21.2 mA peak,
-//     V_burden = 2.33 V peak (~4.7 Vpp) — fills the +/-2.5 V headroom around
-//     the bias point without clipping. Sized for the SCT-013-000 "30A" unit.
-//   - If you swap to a sensor rated for a different max current, re-pick R:
-//       R_burden = V_headroom / (I_max_primary * sqrt(2) / CT_RATIO)
-//     For example, 100 A max -> 33R; 50 A max -> ~56R; 20 A max -> ~150R.
-//   - The 10 uF cap is optional but quiets the bias node; without it expect
-//     ~50-200 mA of zero-current jitter.
+//   - No burden resistor — the -030 has it built in. Adding one in parallel
+//     would lower the effective burden and shrink the output below 1 V/30 A.
+//   - At 30 A primary the output is 1 V RMS (~1.41 V peak), so the signal at
+//     A0 swings ~1.09 V .. ~3.91 V around the 2.5 V bias — well inside the
+//     0-5 V ADC range. The sensor clips internally above ~30 A, so don't
+//     trust readings past nameplate.
+//   - The 10 uF cap is optional but quiets the bias node.
 //
 // HOW THE MATH WORKS:
 //   We sample A0 fast enough to capture many points per AC cycle, subtract
 //   the DC bias, square each sample, then take sqrt(mean) -> ADC RMS in
-//   counts. Convert to volts at the pin, then to amps:
-//       I_primary_RMS = V_pin_RMS / R_burden * CT_RATIO
+//   counts. Convert to volts at the pin, then to amps via the sensor's
+//   voltage-to-current scale:
+//       I_primary_RMS = V_pin_RMS * AMPS_PER_VOLT
 //
 //   Bias is tracked with a slow IIR (alpha = 1/1024). At ~10 kHz sampling
 //   that's a ~1.5 Hz corner — well below 50/60 Hz, so the bias estimate
@@ -55,18 +70,15 @@
 // CONFIG NOTES:
 //   - If zero-current readings are noisy: install the 10 uF cap, lengthen
 //     SAMPLE_WINDOW_MS, or raise NOISE_FLOOR_AMPS.
-//   - If readings clip / cap out: burden resistor is too large for the
-//     current you're measuring. Drop to a smaller value.
 //   - Calibrate by clamping a known load (e.g. a kettle on a known-V outlet)
-//     and adjusting CT_RATIO until reported amps match a clamp meter.
+//     and adjusting AMPS_PER_VOLT until reported amps match a clamp meter.
 //   - Serial Monitor: set Baud Rate to 115200.
 // ============================================================================
 #include <Arduino.h>
 
 // ---------- USER CONFIG ----------
 const uint8_t  PIN_CT             = A0;
-const float    BURDEN_OHMS        = 110.0f;    // burden resistor across CT leads (100R + 10R series, sized for 30A max)
-const float    CT_RATIO           = 2000.0f;   // SCT-013-000 turns ratio (100A:50mA)
+const float    AMPS_PER_VOLT      = 30.0f;     // SCT-013-030: 1 V RMS == 30 A primary
 const float    VREF_VOLTS         = 5.0f;      // ADC reference (Uno = 5.0, 3.3V boards = 3.3)
 const uint16_t ADC_COUNTS         = 1024;      // 10-bit ADC
 
@@ -100,11 +112,10 @@ void setup() {
   analogRead(PIN_CT);  // discard first reading (mux settle)
   seedBias();
 
-  Serial.println(F("# sct-013-000 current test ready"));
-  Serial.print  (F("# burden=")); Serial.print(BURDEN_OHMS, 1);
-  Serial.print  (F("R, ratio=")); Serial.print(CT_RATIO, 0);
-  Serial.print  (F(", window=")); Serial.print(SAMPLE_WINDOW_MS);
-  Serial.print  (F("ms, bias_seed=")); Serial.println(biasCounts, 1);
+  Serial.println(F("# sct-013-030 current test ready"));
+  Serial.print  (F("# amps_per_volt=")); Serial.print(AMPS_PER_VOLT, 1);
+  Serial.print  (F(", window="));        Serial.print(SAMPLE_WINDOW_MS);
+  Serial.print  (F("ms, bias_seed="));   Serial.println(biasCounts, 1);
   Serial.println(F("# format: t_ms, bias_counts, irms_a, samples"));
 }
 
@@ -126,7 +137,7 @@ void loop() {
   if (n > 0) {
     float rmsCounts = sqrtf((float)(sumSq / n));
     float rmsVolts  = rmsCounts * (VREF_VOLTS / (float)ADC_COUNTS);
-    rmsAmps         = rmsVolts / BURDEN_OHMS * CT_RATIO;
+    rmsAmps         = rmsVolts * AMPS_PER_VOLT;
     if (rmsAmps < NOISE_FLOOR_AMPS) rmsAmps = 0.0f;
   }
 

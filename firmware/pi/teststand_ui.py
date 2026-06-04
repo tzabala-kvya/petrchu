@@ -181,6 +181,64 @@ class OutputPanel(tk.Frame):
             dot.config(fg=on_c if on else C_GRAY)
 
 
+class ScrollableFrame(tk.Frame):
+    """
+    Vertical-scrollable container. Put widgets in self.inner; they pack normally,
+    and if the total content exceeds the visible height, a vertical scrollbar
+    appears and mouse-wheel scrolling works while the cursor is over the area.
+
+    Used to host the mode panel (water/air/both/idle), which can exceed the
+    available height when both water and air charts are visible simultaneously
+    in BOTH mode.
+    """
+
+    def __init__(self, parent, **kw):
+        bg = kw.pop("bg", C_BG)
+        super().__init__(parent, bg=bg, **kw)
+        self._canvas    = tk.Canvas(self, bg=bg, highlightthickness=0)
+        self._scrollbar = tk.Scrollbar(self, orient="vertical",
+                                       command=self._canvas.yview)
+        self.inner = tk.Frame(self._canvas, bg=bg)
+        self._win = self._canvas.create_window((0, 0), window=self.inner,
+                                               anchor="nw")
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
+        self.inner.bind("<Configure>",   self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Mouse-wheel scroll only while cursor over the canvas area.
+        self._canvas.bind("<Enter>", lambda e: self._bind_wheel())
+        self._canvas.bind("<Leave>", lambda e: self._unbind_wheel())
+
+    def _on_inner_configure(self, event):
+        # Update scroll region whenever inner content changes size.
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # Match inner frame's width to canvas width so widgets that
+        # pack(fill=tk.X) actually fill the visible area.
+        self._canvas.itemconfig(self._win, width=event.width)
+
+    def _on_wheel_win(self, event):     # Windows / macOS
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_wheel_linux_up(self, event):    # X11 wheel up
+        self._canvas.yview_scroll(-3, "units")
+
+    def _on_wheel_linux_down(self, event):  # X11 wheel down
+        self._canvas.yview_scroll(3, "units")
+
+    def _bind_wheel(self):
+        self._canvas.bind_all("<MouseWheel>", self._on_wheel_win)
+        self._canvas.bind_all("<Button-4>",   self._on_wheel_linux_up)
+        self._canvas.bind_all("<Button-5>",   self._on_wheel_linux_down)
+
+    def _unbind_wheel(self):
+        self._canvas.unbind_all("<MouseWheel>")
+        self._canvas.unbind_all("<Button-4>")
+        self._canvas.unbind_all("<Button-5>")
+
+
 class StripChart:
     """Matplotlib strip chart embedded in Tkinter."""
 
@@ -305,7 +363,15 @@ class TestStandUI:
         self._build_command_bar()     # packs side=BOTTOM internally
         self._build_status_panels()   # packs side=BOTTOM internally
 
-        # --- Dynamic mode-specific panels (created here, packed by _set_mode) ---
+        # --- Scrollable mode container (fills space between top and bottom) ---
+        # The mode panel (especially BOTH = water + air with 3 charts each)
+        # can exceed the available height. A scrollable container lets the
+        # user see everything via the scrollbar or mouse wheel without
+        # cropping any widgets below it.
+        self._mode_container = ScrollableFrame(self.root, bg=C_BG)
+        self._mode_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # --- Dynamic mode-specific panels (children of the scrollable inner) ---
         self._build_idle_panel()
         self._build_water_panel()
         self._build_air_panel()
@@ -346,7 +412,8 @@ class TestStandUI:
         self._mode_label.pack(side=tk.RIGHT, padx=12)
 
     def _build_idle_panel(self):
-        self._idle_frame = tk.Frame(self.root, bg=C_ACCENT, height=200)
+        self._idle_frame = tk.Frame(self._mode_container.inner,
+                                    bg=C_ACCENT, height=200)
         # packed dynamically
         tk.Label(self._idle_frame, text="NO MODE SELECTED",
                  font=(MONO_FAMILY, 20, "bold"),
@@ -360,7 +427,7 @@ class TestStandUI:
 
     def _build_water_panel(self):
         """Water-mode panel: valve cmd/fb, depth, pump, water-side charts."""
-        self._water_frame = tk.Frame(self.root, bg=C_BG)
+        self._water_frame = tk.Frame(self._mode_container.inner, bg=C_BG)
 
         # Big numbers row
         row = tk.Frame(self._water_frame, bg=C_BG)
@@ -396,7 +463,7 @@ class TestStandUI:
 
     def _build_air_panel(self):
         """Air-mode panel: pulse Hz, P1/P2, compressor, air-side charts."""
-        self._air_frame = tk.Frame(self.root, bg=C_BG)
+        self._air_frame = tk.Frame(self._mode_container.inner, bg=C_BG)
 
         row = tk.Frame(self._air_frame, bg=C_BG)
         row.pack(fill=tk.X, pady=4)
@@ -574,29 +641,27 @@ class TestStandUI:
         if mode == self._mode:
             return
         self._mode = mode
-        # Hide everything mode-specific
+
+        # Hide every mode-specific frame; show only what this mode needs.
+        # All three are siblings inside self._mode_container.inner, packed
+        # with fill=X (no expand) so each takes its natural height. The
+        # scrollable container handles overflow when content is taller than
+        # the visible area (notably BOTH mode = water + air).
         self._idle_frame.pack_forget()
         self._water_frame.pack_forget()
         self._air_frame.pack_forget()
 
-        # Show what this mode needs (above the bottom command/status section).
-        # Pack after the fault bar.
-        anchor = self._fault_bar
         if mode == "WATER_ONLY":
-            self._water_frame.pack(fill=tk.BOTH, expand=True,
-                                   padx=4, pady=2, after=anchor)
+            self._water_frame.pack(fill=tk.X, padx=4, pady=2)
             self._dispatch_label.config(text="")
         elif mode == "AIR_ONLY":
-            self._air_frame.pack(fill=tk.BOTH, expand=True,
-                                 padx=4, pady=2, after=anchor)
+            self._air_frame.pack(fill=tk.X, padx=4, pady=2)
             self._dispatch_label.config(text="")
         elif mode == "BOTH":
-            self._water_frame.pack(fill=tk.BOTH, expand=True,
-                                   padx=4, pady=2, after=anchor)
-            self._air_frame.pack(fill=tk.BOTH, expand=True,
-                                 padx=4, pady=2, after=self._water_frame)
+            self._water_frame.pack(fill=tk.X, padx=4, pady=2)
+            self._air_frame.pack(fill=tk.X, padx=4, pady=2)
         else:  # IDLE
-            self._idle_frame.pack(fill=tk.X, padx=4, pady=2, after=anchor)
+            self._idle_frame.pack(fill=tk.X, padx=4, pady=2)
 
         self._mode_label.config(text=f"MODE: {mode}")
 

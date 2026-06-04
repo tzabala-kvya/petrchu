@@ -222,21 +222,69 @@ static const uint8_t PULSES_PER_REV_AIR   = 2;   // >>> VERIFY: magnets on air w
 static const uint8_t PULSES_PER_REV_WATER = 2;   // >>> VERIFY: magnets on water wheel
 static const uint8_t PULSES_PER_REV_ALT   = 2;   // >>> VERIFY: magnets on alternator shaft
 
-// --- Valve servo ---
-// Standard hobby servo pulse range. Most servos work with 544–2400 µs.
-// Some cheaper ones only go 1000–2000 µs. If the servo buzzes or
-// doesn't reach full travel, narrow these.
-// >>> CHECK: test each servo manually first. Send 544µs and 2400µs
-// >>>        and see if it actually hits 0° and 180° without straining.
-static const int VALVE_SERVO_MIN_US = 544;    // pulse width for 0°
-static const int VALVE_SERVO_MAX_US = 2400;   // pulse width for 180°
+// --- Valve servo (OBSOLETE placeholder — see prop valve section below) ---
+// >>> OBSOLETE: these reflect the prior plan to drive the dispatch valves with
+// >>>           a hobby servo + analog pot feedback. The actual valve is the
+// >>>           HSH-Flo 2-way 0-10V proportional ball valve. Drive path is
+// >>>           Arduino PWM -> PWM-to-V converter -> 0-10V command, and feedback
+// >>>           is OC PWM on a digital pin (NOT analogRead). The constants below
+// >>>           are unused; the analog-feedback block in readSensors() (the
+// >>>           VALVE_ENCODER_PRESENT_* path) is wrong for this valve and must
+// >>>           be rewritten to pulseIn() before the prop valve is wired in.
+static const int VALVE_SERVO_MIN_US = 544;    // unused — kept for historical context
+static const int VALVE_SERVO_MAX_US = 2400;   // unused — kept for historical context
+static const bool VALVE_ENCODER_PRESENT_AIR   = false;  // leave false until OC-PWM read path lands
+static const bool VALVE_ENCODER_PRESENT_WATER = false;  // leave false until OC-PWM read path lands
 
-// Set these to true if I actually wire encoder/potentiometer feedback
-// on the valve servos. If false, the code still works — it just won't
-// know the actual position (only the commanded position).
-// >>> DECIDE: am I adding encoders to the valve servos?
-static const bool VALVE_ENCODER_PRESENT_AIR   = false;
-static const bool VALVE_ENCODER_PRESENT_WATER = false;
+// --- Prop valve (HSH-Flo 2-way 0-10V proportional, both air & water) ---
+// Drive: Arduino PWM (pin 9 / 10) -> PWM-to-V converter -> 0-10V -> valve GREEN.
+// Feedback: open-collector PWM on valve WHITE -> digital pin with pull-up,
+//           read via pulseIn() and converted with FB_DUTY_* below.
+// Bench-validated 2026-06-04 on prop_valve_test_uno/. Full measurement notes
+// in memory/prop_valve_dynamics.md.
+
+// Feedback duty endpoints (this specific valve unit, no hydraulic load).
+//   position% = (fb_duty - FB_DUTY_CLOSED_PCT) * 100
+//             / (FB_DUTY_OPEN_PCT - FB_DUTY_CLOSED_PCT)
+// >>> CHECK: rerun the duty sweep in prop_valve_test_uno/ if the valve unit
+// >>>        is swapped. Different physical units WILL have different endpoints.
+static const float FB_DUTY_CLOSED_PCT = 4.9f;
+static const float FB_DUTY_OPEN_PCT   = 93.5f;
+
+// Driver-side scaling. Calibrate the PWM-to-V converter with the valve
+// disconnected so 100% Arduino duty reads ~10.0V at the converter output.
+// >>> CHECK: verify converter is on the 10V range and trimpot is set right
+// >>>        before plugging the valve in.
+static const float VALVE_FULL_SCALE_V = 10.0f;
+
+// Dynamics — drives V-loop anti-windup and dispatch timing.
+// Measured no-load slew: ~13 %position/sec on a 0->100% step, ~11 %position/sec
+// on smaller steps (internal P+rate-limit, not pure slew). Hydraulic back-
+// pressure can only slow this further, so design uses the conservative end.
+// >>> CHECK: re-measure once the valve is plumbed under load; only revise DOWN.
+static const float VALVE_SLEW_PCT_PER_S = 10.0f;
+static const float VALVE_FULL_TRAVEL_S  = 10.0f;  // = 100 / VALVE_SLEW_PCT_PER_S
+
+// V-loop closed-loop bandwidth ceiling implied by the slew constraint.
+// Must sit well below 1 / (2*pi*VALVE_FULL_TRAVEL_S) ≈ 0.016 Hz, else the
+// PI controller fights valve transit and hunts.
+// >>> DECIDE: target ~0.01-0.02 Hz on the bench tune; do NOT chase fast V response.
+static const float V_LOOP_BW_HZ_CEILING = 0.016f;
+
+// Anti-windup band: freeze the integrator while |valve_cmd - valve_feedback|
+// exceeds this (i.e. the valve is mid-transit and V_err shouldn't accumulate).
+// >>> DECIDE: start at 5%; widen if integrator chatters at small steady-state errors.
+static const float VALVE_SLEW_BAND_PCT  = 5.0f;
+
+// Dispatch thresholds compare against position FEEDBACK, not command — at 10 s
+// full travel, "commanded > 80%" can be true while the valve is still in
+// transit and doing nothing. See control_architecture.md.
+// >>> DECIDE: these numbers are from the dispatch spec; revisit if hunting.
+static const float DISPATCH_WATER_OPEN_THRESH_PCT  = 80.0f;
+static const uint16_t DISPATCH_WATER_OPEN_HOLD_MS  = 2000;
+static const float DISPATCH_AIR_CLOSED_THRESH_PCT  = 10.0f;
+static const uint16_t DISPATCH_AIR_CLOSED_HOLD_MS  = 5000;
+static const float DISPATCH_V_ERR_TRIGGER_V        = 0.5f;
 
 // --- MS5837 calibration storage ---
 // These EEPROM addresses store the atmospheric pressure offset so it

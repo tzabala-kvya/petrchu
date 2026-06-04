@@ -25,7 +25,7 @@ const uint8_t PIN_A = 2;          // must be 2 or 3 on Uno
 const uint8_t PIN_B = 4;          // any digital pin
 const uint8_t PIN_Z = 3;          // must be 2 or 3 on Uno; comment out attach
                                   //   below if encoder has no index
-const long   ENCODER_CPR = 0;     // counts per output-shaft revolution.
+const long   ENCODER_CPR = 4;     // counts per output-shaft revolution.
                                   //   0 = unknown -> RPM not computed.
                                   //   To find it: zero counts, spin shaft
                                   //   exactly one rev by hand, read count.

@@ -310,6 +310,10 @@ class TestStandUI:
         self._build_water_panel()
         self._build_air_panel()
 
+        # Now that both _event_log (in status panels) and the manual sliders
+        # (in command bar) exist, set the initial manual-override state.
+        self._toggle_manual()
+
     def _build_top_bar(self):
         top = tk.Frame(self.root, bg=C_BG)
         top.pack(fill=tk.X, padx=6, pady=4)
@@ -523,7 +527,9 @@ class TestStandUI:
                                     command=lambda v: self._on_air_slider())
         self._air_slider.grid(row=1, column=1, padx=4)
 
-        self._toggle_manual()   # set initial enable state
+        # NOTE: _toggle_manual() needs self._event_log (created in
+        # _build_status_panels), so we defer the initial call to the end
+        # of _build_ui() after both panels exist.
 
     # ---------------------------------------------------------------------
     # Command callbacks

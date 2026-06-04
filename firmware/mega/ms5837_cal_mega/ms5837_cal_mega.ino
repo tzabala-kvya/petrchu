@@ -47,7 +47,10 @@
 //
 // LIBRARY: install BlueRobotics MS5837 via Arduino Library Manager
 //   (Tools -> Manage Libraries -> search "MS5837" -> Blue Robotics MS5837).
-//   Works for both MS5837-30BA (300 m / sea-rated, our default) and -02BA.
+//   NOTE: this sketch is configured for the MS5837-02BA. The library does NOT
+//   autodetect the part - it defaults to the -30BA and will mis-scale readings
+//   for our -02BA unless setModel(MS5837::MS5837_02BA) is called (done in
+//   initSensor() below). If you ever swap to a -30BA, change that line.
 // ============================================================================
 #include <Arduino.h>
 #include <Wire.h>
@@ -67,9 +70,14 @@ const uint16_t CAL_SAMPLE_MS = 50;
 // Live readout cadence
 const unsigned long LIVE_PRINT_MS = 500;
 
-// Fluid density for depth conversion (not used here, but the library wants
-// a value set before reading). 997 kg/m^3 = freshwater at ~25 C.
+// Fluid density for depth conversion. 997 kg/m^3 = freshwater at ~25 C.
 const float FLUID_DENSITY_KG_M3 = 997.0f;
+
+// Standard gravity, used to convert a pressure head (Pa) to a column height.
+const float GRAVITY_M_S2 = 9.80665f;
+
+// Fallback atmospheric pressure when no EEPROM cal is stored (standard atm).
+const float ATM_DEFAULT_MBAR = 1013.25f;
 
 // ---------- STATE ----------
 MS5837 sensor;
@@ -103,7 +111,12 @@ static void eepromClear() {
 static bool initSensor() {
   Wire.begin();
   if (!sensor.init()) return false;
-  // Library autodetects model from PROM. Set fluid density for depth math.
+  // IMPORTANT: the Blue Robotics MS5837 library does NOT autodetect the model.
+  // It defaults to MS5837_30BA and applies 30BA conversion math. Our sensor is
+  // the -02BA, so we must set the model explicitly or pressure()/depth() will
+  // be wrong (different scaling/bit-shifts in the second-order temp comp).
+  sensor.setModel(MS5837::MS5837_02BA);
+  // Set fluid density for depth math.
   sensor.setFluidDensity(FLUID_DENSITY_KG_M3);
   return true;
 }
@@ -115,6 +128,18 @@ static float readPressureMbar() {
 
 static float readTemperatureC() {
   return sensor.temperature();
+}
+
+// Calibration-aware depth: subtracts the stored EEPROM atmospheric offset
+// (captured by 'cal' with the sensor dry) instead of the library's hardcoded
+// 101300 Pa standard atmosphere. Falls back to ATM_DEFAULT_MBAR if no cal is
+// stored, so this still produces a reasonable number on an uncalibrated rig.
+//   head_Pa = (p_mbar - atm_mbar) * 100      [mbar -> Pa]
+//   depth_cm = head_Pa / (rho * g) * 100     [m -> cm]
+static float depthCmCalibrated(float p_mbar) {
+  const float atm_mbar = eepromHasValidCal() ? eepromReadAtm() : ATM_DEFAULT_MBAR;
+  const float head_pa  = (p_mbar - atm_mbar) * 100.0f;
+  return head_pa / (FLUID_DENSITY_KG_M3 * GRAVITY_M_S2) * 100.0f;
 }
 
 // ---------- Commands ----------
@@ -209,7 +234,17 @@ static void cmdLive() {
   g_live_mode = true;
   g_last_live_ms = 0;   // print first row immediately
   Serial.println(F("# live mode ON. Send any character to stop."));
-  Serial.println(F("# format: t_ms, p_mbar, t_C, depth_m"));
+  Serial.print(F("# depth_cm uses "));
+  if (eepromHasValidCal()) {
+    Serial.print(F("STORED cal offset "));
+    Serial.print(eepromReadAtm(), 2);
+    Serial.println(F(" mbar"));
+  } else {
+    Serial.print(F("DEFAULT atm "));
+    Serial.print(ATM_DEFAULT_MBAR, 2);
+    Serial.println(F(" mbar (no cal stored - run 'cal')"));
+  }
+  Serial.println(F("# format: t_ms, p_mbar, t_C, depth_cm"));
 }
 
 static void cmdHelp() {
@@ -278,11 +313,11 @@ void loop() {
     g_last_live_ms = millis();
     const float p = readPressureMbar();
     const float t = readTemperatureC();
-    const float d = sensor.depth();   // meters, uses fluid density set in setup
+    const float d_cm = depthCmCalibrated(p);  // uses stored EEPROM atm offset
 
     Serial.print(millis()); Serial.print(',');
     Serial.print(p, 3);     Serial.print(',');
     Serial.print(t, 2);     Serial.print(',');
-    Serial.println(d, 4);
+    Serial.println(d_cm, 2);
   }
 }

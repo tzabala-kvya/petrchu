@@ -2,108 +2,102 @@
 """
 teststand_ui.py
 ===============
-Real-time operator UI for the Water/Air Test Stand.
+Real-time operator UI for the PetrChu test stand.
+
+Three layouts auto-selected from the MODE switches on the operator panel:
+  - MODE_WATER on, MODE_AIR off  -> WATER_ONLY view
+  - MODE_AIR on,   MODE_WATER off -> AIR_ONLY view
+  - both on                       -> BOTH view (water + air + dispatch)
+  - both off                      -> IDLE view (instructions)
+
+State transitions are driven by physical switches on the panel — the Pi can
+NOT change state directly. The only commands the Pi sends are:
+  - V setpoint override (persists in Mega EEPROM)
+  - Manual override (diagnostic, lets the Pi drive actuators directly)
 
 Tkinter + matplotlib strip charts.  Talks to the Mega through
 teststand_logger.Logger.
 
 Usage:
     python teststand_ui.py --port /dev/ttyACM0
-    python teststand_ui.py --port COM3          # Windows
-
-Layout:
-    ┌─────────────────────────────────────────────────────┐
-    │  STATE BADGE  │ P │ RPM_a │ RPM_w │ RPM_s │ V_alt  │  ← big numbers
-    ├───────────────┴───┴───────┴───────┴───────┴────────┤
-    │  Strip chart: Pressure + dP/dt                      │
-    │  Strip chart: RPM (all 3) + driving source          │
-    │  Strip chart: Power (supply, alt, comp, pump)       │
-    ├─────────────────────────────────────────────────────┤
-    │  I/O status indicators │ Event log (scrolling text) │
-    ├─────────────────────────────────────────────────────┤
-    │  Command buttons: ARM  CHARGE  DISCHARGE  STOP  ... │
-    └─────────────────────────────────────────────────────┘
+    python teststand_ui.py --port COM3        # Windows dev
 """
 
 import argparse
 import sys
-import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-from collections import deque
 
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from teststand_logger import Logger, STATE_NAMES, CAL_STATES
+from teststand_logger import (
+    Logger, STATE_NAMES, CHARGE_STATES, DISCHARGE_STATES,
+    ui_mode_from_row,
+)
 
 # =========================================================================
 # CONSTANTS
 # =========================================================================
 
-REFRESH_MS       = 100   # UI update rate (10 Hz matches telemetry)
-CHART_WINDOW_S   = 60    # rolling window on strip charts
-CHART_POINTS     = 600   # 60 s × 10 Hz
+REFRESH_MS    = 100   # UI tick (10 Hz matches telemetry)
+CHART_REDRAW_EVERY = 5   # redraw charts every 5 ticks = 2 Hz (saves CPU)
 
-# Color scheme
-C_BG       = "#1a1a2e"
-C_FG       = "#e0e0e0"
-C_ACCENT   = "#0f3460"
-C_GREEN    = "#2ecc71"
-C_YELLOW   = "#f39c12"
-C_RED      = "#e74c3c"
-C_BLUE     = "#3498db"
-C_PURPLE   = "#9b59b6"
-C_ORANGE   = "#e67e22"
-C_CYAN     = "#1abc9c"
-C_DARK     = "#0d0d1a"
+# Dark theme
+C_BG     = "#1a1a2e"
+C_FG     = "#e0e0e0"
+C_ACCENT = "#0f3460"
+C_DARK   = "#0d0d1a"
+C_GREEN  = "#2ecc71"
+C_YELLOW = "#f39c12"
+C_RED    = "#e74c3c"
+C_BLUE   = "#3498db"
+C_CYAN   = "#1abc9c"
+C_PURPLE = "#9b59b6"
+C_ORANGE = "#e67e22"
+C_GRAY   = "#666"
 
 STATE_COLORS = {
-    "BOOT_SELFTEST":    C_YELLOW,
-    "CAL_PROMPT":       C_ORANGE,
-    "CAL_ZEROING":      C_ORANGE,
-    "CAL_REPLACE":      C_ORANGE,
-    "OFF":              C_FG,
-    "ARM":              C_GREEN,
-    "CHARGE":           C_YELLOW,
-    "READY":            C_GREEN,
-    "DISCHARGE_AIR":    C_BLUE,
-    "DISCHARGE_WATER":  C_CYAN,
-    "DISCHARGE_BOTH":   C_PURPLE,
-    "MANUAL_DIAG":      C_ORANGE,
-    "SHUTDOWN":         C_YELLOW,
-    "FAULT":            C_RED,
-    "ESTOP":            C_RED,
+    "BOOT_SELFTEST":   C_YELLOW,
+    "OFF":             C_FG,
+    "ARMED_IDLE":      C_GREEN,
+    "CHARGE_AIR":      C_YELLOW,
+    "CHARGE_WATER":    C_YELLOW,
+    "CHARGE_BOTH":     C_YELLOW,
+    "DISCHARGE_AIR":   C_BLUE,
+    "DISCHARGE_WATER": C_CYAN,
+    "DISCHARGE_BOTH":  C_PURPLE,
+    "SHUTDOWN":        C_YELLOW,
+    "FAULT":           C_RED,
+    "ESTOP":           C_RED,
 }
 
 
 # =========================================================================
-# BIG NUMBER WIDGET
+# WIDGETS
 # =========================================================================
 
 class BigNumber(tk.Frame):
-    """A large numeric readout with label and optional bar/color coding."""
+    """Large numeric readout with label, unit, optional warning thresholds."""
 
-    def __init__(self, parent, label: str, unit: str = "",
-                 warn_hi=None, crit_hi=None, fmt=".1f", width=120):
-        super().__init__(parent, bg=C_BG, width=width)
+    def __init__(self, parent, label, unit="", fmt=".1f",
+                 warn_hi=None, crit_hi=None, warn_lo=None, crit_lo=None):
+        super().__init__(parent, bg=C_BG)
+        self.fmt = fmt
         self.warn_hi = warn_hi
         self.crit_hi = crit_hi
-        self.fmt     = fmt
+        self.warn_lo = warn_lo
+        self.crit_lo = crit_lo
 
-        self._label = tk.Label(self, text=label, font=("Consolas", 9),
-                               fg="#888", bg=C_BG)
-        self._label.pack(anchor="w", padx=4)
-
+        tk.Label(self, text=label, font=("Consolas", 9), fg=C_GRAY,
+                 bg=C_BG).pack(anchor="w", padx=4)
         self._value = tk.Label(self, text="---", font=("Consolas", 22, "bold"),
                                fg=C_FG, bg=C_BG)
         self._value.pack(anchor="w", padx=4)
-
-        self._unit = tk.Label(self, text=unit, font=("Consolas", 9),
-                              fg="#888", bg=C_BG)
-        self._unit.pack(anchor="w", padx=4)
+        tk.Label(self, text=unit, font=("Consolas", 9), fg=C_GRAY,
+                 bg=C_BG).pack(anchor="w", padx=4)
 
     def set(self, value):
         if value is None or value == "":
@@ -113,87 +107,81 @@ class BigNumber(tk.Frame):
             v = float(value)
             txt = f"{v:{self.fmt}}"
         except (ValueError, TypeError):
-            txt = str(value)
-            self._value.config(text=txt, fg=C_FG)
+            self._value.config(text=str(value), fg=C_FG)
             return
-
         color = C_FG
-        if self.crit_hi is not None and v >= self.crit_hi:
-            color = C_RED
-        elif self.warn_hi is not None and v >= self.warn_hi:
-            color = C_YELLOW
+        if   self.crit_hi is not None and v >= self.crit_hi: color = C_RED
+        elif self.crit_lo is not None and v <= self.crit_lo: color = C_RED
+        elif self.warn_hi is not None and v >= self.warn_hi: color = C_YELLOW
+        elif self.warn_lo is not None and v <= self.warn_lo: color = C_YELLOW
         self._value.config(text=txt, fg=color)
 
 
-# =========================================================================
-# IO STATUS PANEL
-# =========================================================================
+class SwitchPanel(tk.Frame):
+    """LED-style indicators for the 6 operator-panel switches + E-stop."""
 
-class IOStatusPanel(tk.Frame):
-    """Grid of small LED-like indicators for actuator states."""
+    SWITCHES = [
+        ("E-STOP",     "estop",      C_RED,   C_GREEN),   # active = bad
+        ("ARM",        "arm",        C_GREEN, C_GRAY),
+        ("MODE_AIR",   "mode_air",   C_BLUE,  C_GRAY),
+        ("MODE_WATER", "mode_water", C_CYAN,  C_GRAY),
+        ("CHARGE",     "charge",     C_YELLOW, C_GRAY),
+        ("DISCHARGE",  "discharge",  C_PURPLE, C_GRAY),
+    ]
 
     def __init__(self, parent):
         super().__init__(parent, bg=C_BG)
+        self._dots = {}
+        for i, (lbl, key, on_color, off_color) in enumerate(self.SWITCHES):
+            tk.Label(self, text=lbl, font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+                     width=12).grid(row=0, column=i, padx=2)
+            d = tk.Label(self, text="●", font=("Consolas", 18), fg=off_color,
+                         bg=C_BG)
+            d.grid(row=1, column=i, padx=2)
+            self._dots[key] = (d, on_color, off_color)
 
-        self._indicators = {}
-        labels = [
-            ("E-STOP",     "estop"),
-            ("ARM",        "arm_switch"),
-            ("CONTACTOR",  "contactor_cmd"),
-            ("SOL AIR",    "sol_air_cmd"),
-            ("SOL WATER",  "sol_water_cmd"),
-            ("CHG AIR",    "valve_charge_air_cmd"),
-            ("CHG WATER",  "valve_charge_water_cmd"),
-            ("DSC AIR",    "valve_disch_air_cmd"),
-            ("DSC WATER",  "valve_disch_water_cmd"),
-            ("VENT",       "vent_cmd"),
-            ("TANK FULL",  "tank_full"),
-            ("TANK EMPTY", "tank_empty"),
-        ]
-
-        for i, (text, key) in enumerate(labels):
-            row, col = divmod(i, 6)
-            lbl = tk.Label(self, text=text, font=("Consolas", 8),
-                           fg="#888", bg=C_BG, width=12)
-            lbl.grid(row=row*2, column=col, padx=2, pady=0)
-            dot = tk.Label(self, text="●", font=("Consolas", 14),
-                           fg="#444", bg=C_BG)
-            dot.grid(row=row*2+1, column=col, padx=2, pady=0)
-            self._indicators[key] = dot
-
-    def update(self, row: dict):
-        for key, dot in self._indicators.items():
-            val = row.get(key, 0)
-            try:
-                on = int(val) != 0
-            except (ValueError, TypeError):
-                on = False
-
-            if key == "estop":
-                dot.config(fg=C_RED if on else C_GREEN)
-            elif key in ("tank_full", "tank_empty"):
-                dot.config(fg=C_YELLOW if on else "#444")
-            else:
-                dot.config(fg=C_GREEN if on else "#444")
+    def update(self, row):
+        for key, (dot, on_c, off_c) in self._dots.items():
+            on = int(row.get(key, 0)) != 0
+            dot.config(fg=on_c if on else off_c)
 
 
-# =========================================================================
-# STRIP CHART
-# =========================================================================
+class OutputPanel(tk.Frame):
+    """LED-style indicators for actuator output states (from telemetry bitmap)."""
+
+    OUTPUTS = [
+        ("COMPRESSOR",  "compressor_on",    C_YELLOW),
+        ("PUMP",        "pump_on",          C_YELLOW),
+        ("AIR ARM",     "air_arm_open",     C_BLUE),
+        ("WATER VALVE", "water_valve_open", C_CYAN),
+        ("AIR PULSE",   "air_pulsing",      C_BLUE),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=C_BG)
+        self._dots = {}
+        for i, (lbl, key, on_c) in enumerate(self.OUTPUTS):
+            tk.Label(self, text=lbl, font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+                     width=12).grid(row=0, column=i, padx=2)
+            d = tk.Label(self, text="●", font=("Consolas", 18), fg=C_GRAY,
+                         bg=C_BG)
+            d.grid(row=1, column=i, padx=2)
+            self._dots[key] = (d, on_c)
+
+    def update(self, row):
+        for key, (dot, on_c) in self._dots.items():
+            on = int(row.get(key, 0)) != 0
+            dot.config(fg=on_c if on else C_GRAY)
+
 
 class StripChart:
     """Matplotlib strip chart embedded in Tkinter."""
 
-    def __init__(self, parent, title: str, y_label: str,
-                 traces: list[tuple[str, str, str]],
-                 y_range: tuple = None):
-        """
-        traces: list of (csv_key, legend_label, color)
-        """
+    def __init__(self, parent, title, y_label, traces, y_range=None, height=1.5):
+        """traces: list of (key, label, color)"""
         self.traces  = traces
         self.y_range = y_range
-
-        self.fig = Figure(figsize=(8, 1.8), dpi=100, facecolor=C_DARK)
+        self.fig = Figure(figsize=(8, height), dpi=100, facecolor=C_DARK)
         self.ax  = self.fig.add_subplot(111)
         self.ax.set_facecolor(C_DARK)
         self.ax.set_title(title, color=C_FG, fontsize=9, loc="left")
@@ -204,29 +192,21 @@ class StripChart:
         self.ax.grid(True, color="#333", linewidth=0.5, alpha=0.5)
 
         self._lines = {}
-        for key, label, color in traces:
-            line, = self.ax.plot([], [], color=color, linewidth=1.2,
-                                label=label)
+        for key, lbl, color in traces:
+            line, = self.ax.plot([], [], color=color, linewidth=1.2, label=lbl)
             self._lines[key] = line
-
         self.ax.legend(loc="upper left", fontsize=7, framealpha=0.3,
-                       facecolor=C_DARK, edgecolor="#444",
-                       labelcolor=C_FG)
+                       facecolor=C_DARK, edgecolor="#444", labelcolor=C_FG)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=tk.X, padx=4, pady=2)
+        self.fig.tight_layout(pad=0.8)
 
-        self.fig.tight_layout(pad=1.0)
-
-    def update(self, history: list):
+    def update(self, history):
         if not history:
             return
-
-        n = len(history)
-        # X axis: seconds ago (most recent = 0, oldest = negative)
         t0 = history[-1].get("timestamp_ms", 0)
         xs = [(h.get("timestamp_ms", 0) - t0) / 1000.0 for h in history]
-
         for key, _, _ in self.traces:
             ys = []
             for h in history:
@@ -236,16 +216,13 @@ class StripChart:
                 except (ValueError, TypeError):
                     ys.append(0.0)
             self._lines[key].set_data(xs, ys)
-
         if xs:
             self.ax.set_xlim(min(xs), max(xs) + 0.1)
-
         if self.y_range:
             self.ax.set_ylim(*self.y_range)
         else:
             self.ax.relim()
             self.ax.autoscale_view(scaley=True, scalex=False)
-
         self.canvas.draw_idle()
 
 
@@ -254,173 +231,303 @@ class StripChart:
 # =========================================================================
 
 class TestStandUI:
-    def __init__(self, logger: Logger):
+    def __init__(self, logger: Logger, fullscreen: bool = False):
         self.logger = logger
         self.root = tk.Tk()
-        self.root.title("Test Stand Operator Console")
+        self.root.title("PetrChu Test Stand")
         self.root.configure(bg=C_BG)
-        self.root.geometry("1100x900")
+        self.root.geometry("1280x900")
+        if fullscreen:
+            self.root.attributes("-fullscreen", True)
+            self.root.bind("<Escape>", lambda e: self.root.destroy())
+
+        self._mode  = None   # current UI mode string
+        self._tick  = 0
+        self._manual_on = False
 
         self._build_ui()
         self._schedule_refresh()
 
+    # ---------------------------------------------------------------------
+    # UI construction
+    # ---------------------------------------------------------------------
+
     def _build_ui(self):
-        # ---- Top row: state badge + big numbers ----
+        # Top bar: state badge + always-on big numbers + UI mode label
+        self._build_top_bar()
+
+        # Fault bar (under top, shown only when faults active)
+        self._fault_bar = tk.Label(self.root, text="",
+                                   font=("Consolas", 11, "bold"),
+                                   fg=C_RED, bg=C_DARK, anchor="w")
+        self._fault_bar.pack(fill=tk.X, padx=6, pady=1)
+
+        # IDLE panel (shown when no MODE switch is on)
+        self._build_idle_panel()
+
+        # Mode-specific panels
+        self._build_water_panel()
+        self._build_air_panel()
+
+        # Bottom: switches, outputs, event log
+        self._build_status_panels()
+
+        # Commands: V setpoint slider + manual override
+        self._build_command_bar()
+
+        # Status footer
+        self._status = tk.Label(self.root, text="Connecting...",
+                                font=("Consolas", 8), fg=C_GRAY, bg=C_DARK,
+                                anchor="w")
+        self._status.pack(fill=tk.X)
+
+    def _build_top_bar(self):
         top = tk.Frame(self.root, bg=C_BG)
         top.pack(fill=tk.X, padx=6, pady=4)
 
-        self._state_label = tk.Label(top, text="---", font=("Consolas", 20, "bold"),
+        # State badge
+        self._state_label = tk.Label(top, text="---",
+                                     font=("Consolas", 20, "bold"),
                                      fg=C_FG, bg=C_ACCENT, width=18,
                                      relief=tk.RIDGE, borderwidth=2)
         self._state_label.pack(side=tk.LEFT, padx=4, ipady=8)
 
-        self._nums = {}
-        num_defs = [
-            ("p_line_psi",      "PRESSURE",    "psi",   100, 120, ".0f"),
-            ("rpm_air",         "RPM AIR",     "rpm",   None, None, ".0f"),
-            ("rpm_water",       "RPM WATER",   "rpm",   None, None, ".0f"),
-            ("rpm_alternator",  "RPM ALT",     "rpm",   None, None, ".0f"),
-            ("v_alt_V",         "V_ALT",       "V",     None, None, ".1f"),
-            ("power_alt_W",     "P_ALT",       "W",     None, None, ".1f"),
-            ("v_bus_V",         "V_BUS",       "V",     11.5, None, ".1f"),
-            ("water_level_cm",  "LEVEL",       "cm",    None, None, ".1f"),
-        ]
-        for key, label, unit, warn, crit, fmt in num_defs:
-            bn = BigNumber(top, label, unit, warn_hi=warn, crit_hi=crit, fmt=fmt)
+        # Always-visible numbers: V_alt, target, power, efficiency
+        self._top_nums = {}
+        for key, lbl, unit, fmt, kwargs in [
+            ("v_alt_V",          "V_ALT",   "V",   ".2f",
+                {"warn_lo": 0.5}),
+            ("v_setpoint_V",     "TARGET",  "V",   ".2f", {}),
+            ("power_alt_W",      "P_OUT",   "W",   ".1f", {}),
+            ("i_load_A",         "I_LOAD",  "A",   ".2f", {}),
+            ("eta_round_trip_pct", "η",     "%",   ".1f", {}),
+        ]:
+            bn = BigNumber(top, lbl, unit, fmt=fmt, **kwargs)
             bn.pack(side=tk.LEFT, padx=3)
-            self._nums[key] = bn
+            self._top_nums[key] = bn
 
-        # ---- Fault bar ----
-        self._fault_bar = tk.Label(self.root, text="", font=("Consolas", 10, "bold"),
-                                   fg=C_RED, bg=C_DARK, anchor="w")
-        self._fault_bar.pack(fill=tk.X, padx=6, pady=1)
+        # UI mode label (right-aligned)
+        self._mode_label = tk.Label(top, text="MODE: ---",
+                                    font=("Consolas", 14, "bold"),
+                                    fg=C_GRAY, bg=C_BG)
+        self._mode_label.pack(side=tk.RIGHT, padx=12)
 
-        # ---- Calibration panel (shown only during CAL states) ----
-        self._cal_frame = tk.Frame(self.root, bg="#2a1a00", relief=tk.RIDGE, bd=2)
-        # Packed dynamically — starts hidden
+    def _build_idle_panel(self):
+        self._idle_frame = tk.Frame(self.root, bg=C_ACCENT, height=200)
+        # packed dynamically
+        tk.Label(self._idle_frame, text="NO MODE SELECTED",
+                 font=("Consolas", 20, "bold"),
+                 fg=C_YELLOW, bg=C_ACCENT).pack(pady=(20, 4))
+        tk.Label(self._idle_frame,
+                 text="Flip MODE_AIR or MODE_WATER on the operator panel\n"
+                      "to begin. Combine both for DISCHARGE_BOTH.",
+                 font=("Consolas", 11), fg=C_FG, bg=C_ACCENT,
+                 justify=tk.CENTER).pack(pady=4)
+        self._idle_visible = False
 
-        self._cal_title = tk.Label(self._cal_frame, text="",
-                                   font=("Consolas", 14, "bold"),
-                                   fg=C_ORANGE, bg="#2a1a00")
-        self._cal_title.pack(pady=(8, 2))
+    def _build_water_panel(self):
+        """Water-mode panel: valve cmd/fb, depth, pump, water-side charts."""
+        self._water_frame = tk.Frame(self.root, bg=C_BG)
 
-        self._cal_msg = tk.Label(self._cal_frame, text="",
-                                 font=("Consolas", 10), fg=C_FG, bg="#2a1a00",
-                                 wraplength=800, justify=tk.LEFT)
-        self._cal_msg.pack(pady=4, padx=12)
+        # Big numbers row
+        row = tk.Frame(self._water_frame, bg=C_BG)
+        row.pack(fill=tk.X, pady=4)
+        self._water_nums = {}
+        for key, lbl, unit, fmt, kwargs in [
+            ("water_valve_cmd_pct", "VALVE CMD",  "%",     ".1f", {}),
+            ("water_valve_fb_pct",  "VALVE FB",   "%",     ".1f", {}),
+            ("depth_cm",            "TANK DEPTH", "cm",    ".1f",
+                {"warn_lo": 10.0, "crit_lo": 5.0}),
+            ("i_pump_A",            "I_PUMP",     "A",     ".2f", {}),
+            ("power_pump_W",        "P_PUMP",     "W",     ".1f", {}),
+            ("rpm_alt",             "ALT RPM",    "rpm",   ".0f", {}),
+        ]:
+            bn = BigNumber(row, lbl, unit, fmt=fmt, **kwargs)
+            bn.pack(side=tk.LEFT, padx=3)
+            self._water_nums[key] = bn
 
-        self._cal_reading = tk.Label(self._cal_frame, text="",
-                                     font=("Consolas", 11), fg=C_CYAN, bg="#2a1a00")
-        self._cal_reading.pack(pady=2)
+        # Strip charts
+        self._chart_water_v = StripChart(
+            self._water_frame, "V_alt (water)", "V",
+            [("v_alt_V",      "V_alt",  C_GREEN),
+             ("v_setpoint_V", "target", C_YELLOW)])
+        self._chart_water_valve = StripChart(
+            self._water_frame, "Water valve position", "%",
+            [("water_valve_cmd_pct", "commanded", C_CYAN),
+             ("water_valve_fb_pct",  "feedback",  C_BLUE)],
+            y_range=(0, 105))
+        self._chart_water_power = StripChart(
+            self._water_frame, "Power flow", "W",
+            [("power_alt_W",  "alt out", C_GREEN),
+             ("power_pump_W", "pump in", C_ORANGE)])
 
-        cal_btn_frame = tk.Frame(self._cal_frame, bg="#2a1a00")
-        cal_btn_frame.pack(pady=8)
+    def _build_air_panel(self):
+        """Air-mode panel: pulse Hz, P1/P2, compressor, air-side charts."""
+        self._air_frame = tk.Frame(self.root, bg=C_BG)
 
-        self._btn_cal_zero = tk.Button(
-            cal_btn_frame, text="SENSOR IS DRY — ZERO NOW",
-            font=("Consolas", 10, "bold"), fg=C_DARK, bg=C_ORANGE,
-            width=30, command=lambda: self.logger.commander.cal_zero())
-        self._btn_cal_zero.pack(side=tk.LEFT, padx=6)
+        row = tk.Frame(self._air_frame, bg=C_BG)
+        row.pack(fill=tk.X, pady=4)
+        self._air_nums = {}
+        for key, lbl, unit, fmt, kwargs in [
+            ("air_pulse_hz",   "PULSE Hz",  "Hz",    ".2f", {}),
+            ("p1_vessel_psi",  "P1 VESSEL", "psi",   ".1f",
+                {"warn_hi": 70.0, "crit_hi": 85.0}),
+            ("p2_motor_psi",   "P2 MOTOR",  "psi",   ".1f",
+                {"warn_hi": 50.0, "crit_hi": 56.5}),
+            ("i_comp_A",       "I_COMP",    "A",     ".2f", {}),
+            ("power_comp_W",   "P_COMP",    "W",     ".1f", {}),
+            ("rpm_alt",        "ALT RPM",   "rpm",   ".0f", {}),
+        ]:
+            bn = BigNumber(row, lbl, unit, fmt=fmt, **kwargs)
+            bn.pack(side=tk.LEFT, padx=3)
+            self._air_nums[key] = bn
 
-        self._btn_cal_done = tk.Button(
-            cal_btn_frame, text="SENSOR IS BACK IN WATER — GO",
-            font=("Consolas", 10, "bold"), fg=C_DARK, bg=C_GREEN,
-            width=30, command=lambda: self.logger.commander.cal_done())
-        self._btn_cal_done.pack(side=tk.LEFT, padx=6)
+        # Dispatch banner (only shown in BOTH mode)
+        self._dispatch_label = tk.Label(self._air_frame, text="",
+                                        font=("Consolas", 11, "bold"),
+                                        fg=C_FG, bg=C_ACCENT, anchor="w")
+        self._dispatch_label.pack(fill=tk.X, padx=4, pady=2)
 
-        self._btn_cal_skip = tk.Button(
-            cal_btn_frame, text="SKIP CALIBRATION",
-            font=("Consolas", 10, "bold"), fg=C_DARK, bg=C_FG,
-            width=20, command=lambda: self.logger.commander.cal_skip())
-        self._btn_cal_skip.pack(side=tk.LEFT, padx=6)
+        # Strip charts
+        self._chart_air_v = StripChart(
+            self._air_frame, "V_alt (air)", "V",
+            [("v_alt_V",      "V_alt",  C_GREEN),
+             ("v_setpoint_V", "target", C_YELLOW)])
+        self._chart_air_pulse = StripChart(
+            self._air_frame, "Air pulse rate", "Hz",
+            [("air_pulse_hz", "commanded", C_BLUE)],
+            y_range=(0, 5.5))
+        self._chart_air_pressure = StripChart(
+            self._air_frame, "Air-chain pressure", "psi",
+            [("p1_vessel_psi", "P1 vessel",      C_PURPLE),
+             ("p2_motor_psi",  "P2 motor inlet", C_ORANGE)])
 
-        self._cal_visible = False
-
-        # ---- Strip charts ----
-        chart_frame = tk.Frame(self.root, bg=C_BG)
-        chart_frame.pack(fill=tk.BOTH, expand=True, padx=2)
-
-        self._chart_pressure = StripChart(
-            chart_frame, "Pressure", "psi",
-            [("p_line_psi",      "Line (psi)",  C_BLUE),
-             ("dp_dt_psi_per_s", "dP/dt",       C_YELLOW)],
-        )
-
-        self._chart_rpm = StripChart(
-            chart_frame, "RPM", "rpm",
-            [("rpm_air",        "Air",       C_CYAN),
-             ("rpm_water",      "Water",     C_BLUE),
-             ("rpm_alternator", "Alternator", C_PURPLE)],
-        )
-
-        self._chart_power = StripChart(
-            chart_frame, "Power", "W",
-            [("power_alt_W",        "Alt Out",    C_GREEN),
-             ("power_supply_W",     "Supply",     C_YELLOW),
-             ("power_compressor_W", "Compressor", C_ORANGE),
-             ("power_pump_W",       "Pump",       C_CYAN)],
-        )
-
-        # ---- Bottom section: IO + events + buttons ----
+    def _build_status_panels(self):
         bottom = tk.Frame(self.root, bg=C_BG)
         bottom.pack(fill=tk.X, padx=6, pady=4)
 
-        # IO indicators
-        io_frame = tk.LabelFrame(bottom, text="I/O Status",
-                                 font=("Consolas", 9),
-                                 fg=C_FG, bg=C_BG, bd=1)
-        io_frame.pack(side=tk.LEFT, padx=4, anchor="n")
-        self._io_panel = IOStatusPanel(io_frame)
-        self._io_panel.pack(padx=4, pady=4)
+        sw_frame = tk.LabelFrame(bottom, text="Operator panel",
+                                 font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+        sw_frame.pack(side=tk.LEFT, padx=4, anchor="n")
+        self._switch_panel = SwitchPanel(sw_frame)
+        self._switch_panel.pack(padx=4, pady=4)
 
-        # Event log
-        log_frame = tk.LabelFrame(bottom, text="Event Log",
-                                  font=("Consolas", 9),
-                                  fg=C_FG, bg=C_BG, bd=1)
+        out_frame = tk.LabelFrame(bottom, text="Actuator outputs",
+                                  font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+        out_frame.pack(side=tk.LEFT, padx=4, anchor="n")
+        self._output_panel = OutputPanel(out_frame)
+        self._output_panel.pack(padx=4, pady=4)
+
+        log_frame = tk.LabelFrame(bottom, text="Event log",
+                                  font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
         log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
         self._event_log = scrolledtext.ScrolledText(
-            log_frame, height=6, font=("Consolas", 8),
+            log_frame, height=5, font=("Consolas", 8),
             bg=C_DARK, fg=C_FG, insertbackground=C_FG,
             state=tk.DISABLED, wrap=tk.WORD)
         self._event_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        # Command buttons
-        btn_frame = tk.LabelFrame(self.root, text="Commands",
-                                  font=("Consolas", 9),
-                                  fg=C_FG, bg=C_BG, bd=1)
-        btn_frame.pack(fill=tk.X, padx=6, pady=4)
+    def _build_command_bar(self):
+        bar = tk.LabelFrame(self.root, text="Commands (Pi -> Mega)",
+                            font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+        bar.pack(fill=tk.X, padx=6, pady=4)
 
-        buttons = [
-            ("ARM",             lambda: self._cmd("ARM"),             C_GREEN),
-            ("CHARGE AIR",      lambda: self._cmd_charge(True, False), C_YELLOW),
-            ("CHARGE WATER",    lambda: self._cmd_charge(False, True), C_YELLOW),
-            ("CHARGE BOTH",     lambda: self._cmd_charge(True, True),  C_YELLOW),
-            ("DISCHARGE AIR",   lambda: self._cmd("DISCHARGE_AIR"),  C_BLUE),
-            ("DISCHARGE WATER", lambda: self._cmd("DISCHARGE_WATER"),C_CYAN),
-            ("DISCHARGE BOTH",  lambda: self._cmd("DISCHARGE_BOTH"), C_PURPLE),
-            ("STOP",            lambda: self._cmd("STOP"),           C_ORANGE),
-            ("DISARM",          lambda: self._cmd("DISARM"),         C_FG),
-            ("RESET",           lambda: self.logger.commander.request_reset(), C_RED),
-        ]
+        # V setpoint slider + apply button
+        vsp_frame = tk.Frame(bar, bg=C_BG)
+        vsp_frame.pack(side=tk.LEFT, padx=8, pady=4)
+        tk.Label(vsp_frame, text="V setpoint", font=("Consolas", 9),
+                 fg=C_FG, bg=C_BG).pack(anchor="w")
+        self._vsp_var = tk.DoubleVar(value=8.0)
+        self._vsp_scale = tk.Scale(vsp_frame, from_=1.0, to=15.0,
+                                   resolution=0.25, orient=tk.HORIZONTAL,
+                                   variable=self._vsp_var, length=180,
+                                   bg=C_BG, fg=C_FG, troughcolor=C_DARK,
+                                   highlightthickness=0)
+        self._vsp_scale.pack()
+        tk.Button(vsp_frame, text="Apply (writes EEPROM)",
+                  font=("Consolas", 9, "bold"),
+                  fg=C_DARK, bg=C_YELLOW,
+                  command=self._apply_vsp,
+                  width=22).pack(pady=2)
 
-        for text, cmd, color in buttons:
-            b = tk.Button(btn_frame, text=text, command=cmd,
-                          font=("Consolas", 9, "bold"),
-                          fg=C_DARK, bg=color, activebackground=color,
-                          width=14, relief=tk.RAISED, bd=2)
-            b.pack(side=tk.LEFT, padx=3, pady=4)
+        # Manual override
+        man_frame = tk.Frame(bar, bg=C_BG)
+        man_frame.pack(side=tk.LEFT, padx=20, pady=4, fill=tk.Y)
+        self._manual_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(man_frame, text="Manual override (diag only)",
+                       variable=self._manual_var,
+                       command=self._toggle_manual,
+                       font=("Consolas", 9, "bold"),
+                       fg=C_RED, bg=C_BG,
+                       selectcolor=C_DARK,
+                       activebackground=C_BG,
+                       activeforeground=C_RED).pack(anchor="w")
+        tk.Label(man_frame,
+                 text="When ON, PIDs are off in discharge states and the\n"
+                      "sliders below drive the actuators directly.",
+                 font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+                 justify=tk.LEFT).pack(anchor="w")
 
-        # ---- Status bar ----
-        self._status = tk.Label(self.root, text="Connecting...",
-                                font=("Consolas", 8), fg="#888", bg=C_DARK,
-                                anchor="w")
-        self._status.pack(fill=tk.X, padx=0, pady=0)
+        # Manual sliders
+        sl_frame = tk.Frame(bar, bg=C_BG)
+        sl_frame.pack(side=tk.LEFT, padx=12, pady=4)
 
-    def _cmd(self, mode: str):
-        self.logger.commander.request_mode(mode)
+        tk.Label(sl_frame, text="Water valve %", font=("Consolas", 9),
+                 fg=C_FG, bg=C_BG).grid(row=0, column=0, sticky="w")
+        self._water_man_var = tk.DoubleVar(value=0.0)
+        self._water_slider = tk.Scale(sl_frame, from_=0, to=100, resolution=1,
+                                      orient=tk.HORIZONTAL,
+                                      variable=self._water_man_var, length=160,
+                                      bg=C_BG, fg=C_FG, troughcolor=C_DARK,
+                                      highlightthickness=0,
+                                      command=lambda v: self._on_water_slider())
+        self._water_slider.grid(row=0, column=1, padx=4)
 
-    def _cmd_charge(self, air: bool, water: bool):
-        self.logger.commander.set_charge_config(air, water)
+        tk.Label(sl_frame, text="Air pulse Hz", font=("Consolas", 9),
+                 fg=C_FG, bg=C_BG).grid(row=1, column=0, sticky="w")
+        self._air_man_var = tk.DoubleVar(value=0.0)
+        self._air_slider = tk.Scale(sl_frame, from_=0, to=5, resolution=0.1,
+                                    orient=tk.HORIZONTAL,
+                                    variable=self._air_man_var, length=160,
+                                    bg=C_BG, fg=C_FG, troughcolor=C_DARK,
+                                    highlightthickness=0,
+                                    command=lambda v: self._on_air_slider())
+        self._air_slider.grid(row=1, column=1, padx=4)
+
+        self._toggle_manual()   # set initial enable state
+
+    # ---------------------------------------------------------------------
+    # Command callbacks
+    # ---------------------------------------------------------------------
+
+    def _apply_vsp(self):
+        v = float(self._vsp_var.get())
+        self.logger.commander.set_v_setpoint(v)
+        self._log_event(f"V setpoint -> {v:.2f} V (written to EEPROM)")
+
+    def _toggle_manual(self):
+        on = bool(self._manual_var.get())
+        self._manual_on = on
+        self.logger.commander.set_manual(on)
+        for s in (self._water_slider, self._air_slider):
+            s.config(state=tk.NORMAL if on else tk.DISABLED)
+        if not on:
+            # Send 0 to make sure Mega doesn't keep last manual values
+            self.logger.commander.set_water_manual(0.0)
+            self.logger.commander.set_air_manual(0.0)
+        self._log_event(f"Manual override {'ON' if on else 'OFF'}")
+
+    def _on_water_slider(self):
+        if self._manual_on:
+            self.logger.commander.set_water_manual(float(self._water_man_var.get()))
+
+    def _on_air_slider(self):
+        if self._manual_on:
+            self.logger.commander.set_air_manual(float(self._air_man_var.get()))
+
+    # ---------------------------------------------------------------------
+    # Refresh
+    # ---------------------------------------------------------------------
 
     def _log_event(self, text: str):
         self._event_log.config(state=tk.NORMAL)
@@ -428,105 +535,113 @@ class TestStandUI:
         self._event_log.see(tk.END)
         self._event_log.config(state=tk.DISABLED)
 
+    def _set_mode(self, mode: str):
+        if mode == self._mode:
+            return
+        self._mode = mode
+        # Hide everything mode-specific
+        self._idle_frame.pack_forget()
+        self._water_frame.pack_forget()
+        self._air_frame.pack_forget()
+
+        # Show what this mode needs (above the bottom command/status section).
+        # Pack after the fault bar.
+        anchor = self._fault_bar
+        if mode == "WATER_ONLY":
+            self._water_frame.pack(fill=tk.BOTH, expand=True,
+                                   padx=4, pady=2, after=anchor)
+            self._dispatch_label.config(text="")
+        elif mode == "AIR_ONLY":
+            self._air_frame.pack(fill=tk.BOTH, expand=True,
+                                 padx=4, pady=2, after=anchor)
+            self._dispatch_label.config(text="")
+        elif mode == "BOTH":
+            self._water_frame.pack(fill=tk.BOTH, expand=True,
+                                   padx=4, pady=2, after=anchor)
+            self._air_frame.pack(fill=tk.BOTH, expand=True,
+                                 padx=4, pady=2, after=self._water_frame)
+        else:  # IDLE
+            self._idle_frame.pack(fill=tk.X, padx=4, pady=2, after=anchor)
+
+        self._mode_label.config(text=f"MODE: {mode}")
+
     def _refresh(self):
         row = self.logger.get_latest()
-        if row:
-            # State badge
-            sname = row.get("state_name", "---")
-            scolor = STATE_COLORS.get(sname, C_FG)
-            self._state_label.config(text=sname, fg=scolor)
 
-            # Big numbers
-            for key, bn in self._nums.items():
+        if row:
+            sname = row.get("state_name", "---")
+            self._state_label.config(text=sname,
+                                     fg=STATE_COLORS.get(sname, C_FG))
+
+            for key, bn in self._top_nums.items():
                 bn.set(row.get(key))
 
-            # Fault bar
             faults = row.get("fault_list", "NONE")
             if faults != "NONE":
-                self._fault_bar.config(
-                    text=f"⚠ FAULTS: {faults}",
-                    fg=C_RED, bg="#3a0a0a")
+                self._fault_bar.config(text=f"  FAULT: {faults}",
+                                       fg=C_RED, bg="#3a0a0a")
             else:
                 self._fault_bar.config(text="", bg=C_DARK)
 
-            # IO panel
-            self._io_panel.update(row)
+            # Mode switching
+            mode = ui_mode_from_row(row)
+            self._set_mode(mode)
 
-            # Calibration panel visibility and content
-            sname = row.get("state_name", "")
-            if sname in CAL_STATES:
-                if not self._cal_visible:
-                    self._cal_frame.pack(fill=tk.X, padx=6, pady=4,
-                                         after=self._fault_bar)
-                    self._cal_visible = True
+            # Per-mode big numbers
+            if mode in ("WATER_ONLY", "BOTH"):
+                for key, bn in self._water_nums.items():
+                    bn.set(row.get(key))
+            if mode in ("AIR_ONLY", "BOTH"):
+                for key, bn in self._air_nums.items():
+                    bn.set(row.get(key))
 
-                cal_v = row.get("cal_valid", 0)
-                p_atm = row.get("cal_p_atm_mbar", "?")
+            # Dispatch banner (BOTH only)
+            if mode == "BOTH":
+                air_engaged = int(row.get("air_arm_open", 0)) != 0
+                if air_engaged:
+                    self._dispatch_label.config(
+                        text="  DISPATCH: air ENGAGED — both sources contributing",
+                        fg=C_GREEN, bg=C_ACCENT)
+                else:
+                    self._dispatch_label.config(
+                        text="  DISPATCH: water only (air on standby until water saturates)",
+                        fg=C_YELLOW, bg=C_ACCENT)
+            else:
+                self._dispatch_label.config(text="", bg=C_ACCENT)
 
-                if sname == "CAL_PROMPT":
-                    self._cal_title.config(text="SENSOR CALIBRATION REQUIRED")
-                    self._cal_msg.config(
-                        text="Remove the MS5837-02BA from water and let it read "
-                             "ambient air pressure. Press 'SENSOR IS DRY' when ready.\n"
-                             "Or press 'SKIP' to use stored/default offset "
-                             "(water level readings may be inaccurate).")
-                    self._cal_reading.config(
-                        text=f"Current reading: {row.get('p_hydro_mbar', '?')} mbar  |  "
-                             f"Stored offset: {p_atm} mbar  |  "
-                             f"Cal valid: {'YES' if cal_v else 'NO'}")
-                    self._btn_cal_zero.config(state=tk.NORMAL)
-                    self._btn_cal_done.config(state=tk.DISABLED)
-                    self._btn_cal_skip.config(state=tk.NORMAL)
+            self._switch_panel.update(row)
+            self._output_panel.update(row)
 
-                elif sname == "CAL_ZEROING":
-                    self._cal_title.config(text="ZEROING — HOLD STILL")
-                    self._cal_msg.config(
-                        text="Averaging atmospheric pressure. Keep sensor in air, "
-                             "do not move it. This takes about 5 seconds.")
-                    self._cal_reading.config(
-                        text=f"Reading: {row.get('p_hydro_mbar', '?')} mbar")
-                    self._btn_cal_zero.config(state=tk.DISABLED)
-                    self._btn_cal_done.config(state=tk.DISABLED)
-                    self._btn_cal_skip.config(state=tk.DISABLED)
-
-                elif sname == "CAL_REPLACE":
-                    self._cal_title.config(text="CALIBRATION COMPLETE — REPLACE SENSOR")
-                    self._cal_msg.config(
-                        text=f"Atmospheric offset stored: {p_atm} mbar. "
-                             "Place sensor back in water, then press 'GO'.")
-                    self._cal_reading.config(text="")
-                    self._btn_cal_zero.config(state=tk.DISABLED)
-                    self._btn_cal_done.config(state=tk.NORMAL)
-                    self._btn_cal_skip.config(state=tk.NORMAL)
-
-            elif self._cal_visible:
-                self._cal_frame.pack_forget()
-                self._cal_visible = False
-
-            # Status bar
+            # Status footer
             s = self.logger.stats
             self._status.config(
                 text=f"  Session: {self.logger.session_id[:8]}  |  "
                      f"Rows: {s['rows']}  |  Errors: {s['errors']}  |  "
-                     f"Driving: {row.get('driving_source', '?')}  |  "
-                     f"Energy gen: {row.get('energy_alt_J', 0):.1f} J")
+                     f"η: {row.get('eta_round_trip_pct', 0):.1f}%  |  "
+                     f"Energy out: {row.get('energy_alt_J', 0):.1f} J  |  "
+                     f"Energy in: {row.get('energy_input_J', 0):.1f} J")
+        else:
+            self._status.config(text="  Waiting for telemetry...")
 
-        # Events
+        # Event log drain
         ev = self.logger.get_latest_event()
         if ev:
-            self._log_event(
-                f"[{ev.get('timestamp_iso', '?')[11:23]}] "
-                f"{ev.get('event_type', '?')}: {ev.get('detail', '')}")
+            ts = ev.get("timestamp_iso", "?")[11:23]
+            self._log_event(f"[{ts}] {ev.get('event_type','?')}: {ev.get('detail','')}")
 
-        # Charts (update at reduced rate to save CPU: every 5th call = 2 Hz)
-        if not hasattr(self, '_chart_tick'):
-            self._chart_tick = 0
-        self._chart_tick += 1
-        if self._chart_tick % 5 == 0:
+        # Charts at reduced rate
+        self._tick += 1
+        if self._tick % CHART_REDRAW_EVERY == 0:
             history = self.logger.get_history()
-            self._chart_pressure.update(history)
-            self._chart_rpm.update(history)
-            self._chart_power.update(history)
+            mode = self._mode
+            if mode in ("WATER_ONLY", "BOTH"):
+                self._chart_water_v.update(history)
+                self._chart_water_valve.update(history)
+                self._chart_water_power.update(history)
+            if mode in ("AIR_ONLY", "BOTH"):
+                self._chart_air_v.update(history)
+                self._chart_air_pulse.update(history)
+                self._chart_air_pressure.update(history)
 
     def _schedule_refresh(self):
         self._refresh()
@@ -544,17 +659,25 @@ class TestStandUI:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Stand Operator UI")
-    parser.add_argument("--port", default="/dev/ttyACM0",
-                        help="Serial port")
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--test-id", default="")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="PetrChu Test Stand UI")
+    p.add_argument("--port", default="/dev/ttyACM0", help="Serial port")
+    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--test-id", default="")
+    p.add_argument("--mains-v", type=float, default=120.0,
+                   help="AC mains voltage assumed for pump/comp power calc")
+    p.add_argument("--fullscreen", action="store_true",
+                   help="Launch full-screen (for HDMI kiosk demo)")
+    args = p.parse_args()
 
-    logger = Logger(port=args.port, baud=args.baud, test_id=args.test_id)
+    try:
+        logger = Logger(port=args.port, baud=args.baud,
+                        test_id=args.test_id, mains_v=args.mains_v)
+    except Exception as e:
+        print(f"Failed to open serial port {args.port}: {e}", file=sys.stderr)
+        sys.exit(1)
+
     logger.start()
-
-    ui = TestStandUI(logger)
+    ui = TestStandUI(logger, fullscreen=args.fullscreen)
     ui.run()
 
 

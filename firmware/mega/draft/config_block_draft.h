@@ -2,29 +2,33 @@
 // config_block_draft.h
 // ----------------------------------------------------------------------------
 // DRAFT refactored configuration block for TestStandFirmware.ino.
-// Replaces the existing CONFIGURATION sections (currently lines ~29-249 in
-// TestStandFirmware.ino) with a cleaner layout that supports the new
-// V-regulation control loop, dispatch logic, and expanded fault taxonomy.
+// Replaces the existing CONFIGURATION sections (currently lines ~29-300 of
+// TestStandFirmware.ino) with a layout that reflects the post-pivot
+// architecture:
 //
-// >>> REVIEW: this is a draft — none of these constants are committed.
-// >>>         Every section has at least one >>> marker that needs attention
-// >>>         before this gets merged into the main sketch.
+//   - Air side regulated via PULSE-RATE-MODULATED SOLENOID, not servo prop
+//     valve. Air-side prop valve hardware is gone. Pulse-rate PID structure
+//     lifts from mosfet_fusch_pid_uno (error variable switched from psi -> V).
+//   - Water side keeps the HSH-Flo 0-10V proportional valve on d9 PWM, with
+//     OC-PWM white-wire feedback on d4. Drive + feedback code lifts from
+//     prop_valve_test_uno.
+//   - Alternator RPM via quadrature encoder (CPR=4) on d2/d3. Old alt hall
+//     and air-side hall removed. Water-side hall optional (default OFF).
+//   - One ACS712 (load side). 5V-bus current sense removed. One voltage
+//     sensor (V_alt). Bus-voltage sensor removed.
+//   - 5-switch operator panel + 1 E-stop, no buttons.
+//   - 5 status LEDs (R/G/Y/B/W) + piezo.
+//   - MS5837 is the -02BA variant; requires setModel(MS5837_02BA) on the
+//     Blue Robotics library (does NOT autodetect). Atm offset stored in
+//     EEPROM; cal procedure in firmware/mega/ms5837_cal_mega/.
 //
-// Layout matches the convention recorded in memory:
-//   1. Pin assignments        ( >>> VERIFY against schematic )
-//   2. Calibration constants  ( >>> CHECK on bench )
-//   3. Operating setpoints    ( >>> DECIDE )
-//   4. Fault thresholds       ( >>> DECIDE )
-//   5. Gear ratios            ( >>> VERIFY once locked )
-//   6. Dispatch & engagement  ( >>> TUNE )
-//   7. PID gains              ( >>> TUNE )
-//   8. Loop rates             ( unchanged from current firmware )
-//   9. EEPROM layout          ( additive — extends current map )
-//
-// >>> REVIEW: using `static const` to match the existing TestStandFirmware.ino
-// >>>         style. If this header gets #included from multiple translation
-// >>>         units, switch to `inline constexpr` (C++17) to avoid duplicate
-// >>>         definitions. Arduino .ino sketches are single TU so this is fine.
+// >>> REVIEW markers split into action categories:
+// >>>   VERIFY    - check against schematic / hardware before flashing
+// >>>   MEASURE   - bench-measure the actual value, override the placeholder
+// >>>   DECIDE    - design call, owner Tristan
+// >>>   BLOCKED   - waits on Brennan (vessel) or Philip (turbine + bevel teeth)
+// >>>   TUNE      - PID/dispatch placeholders, expect iteration
+// >>>   PLACEHOLDER - guessed number, replace before relying on it
 // ============================================================================
 
 #ifndef CONFIG_BLOCK_DRAFT_H
@@ -35,229 +39,270 @@
 // ============================================================================
 // 1. PIN ASSIGNMENTS
 // ============================================================================
-// Most pins UNCHANGED from current TestStandFirmware.ino. Listed here for
-// completeness so config is in one place.
+// >>> VERIFY every pin against actual wiring before powering on.
 //
-// >>> VERIFY every pin against the actual wiring before powering on.
+// Mega external-interrupt pin pool: d2, d3, d18, d19, d20, d21.
+// d20/d21 are SDA/SCL (MS5837 I2C), so the usable interrupt pool is
+// d2, d3, d18, d19. Allocation below uses all four.
 
-// --- Digital outputs (UNCHANGED) ---
-static const uint8_t PIN_COMPRESSOR_CONT  = 22;
-static const uint8_t PIN_PUMP_CONT        = 23;
-static const uint8_t PIN_DISCH_SOL_AIR    = 24;
-static const uint8_t PIN_DISCH_SOL_WATER  = 25;
-static const uint8_t PIN_STATUS_LED_GREEN = 13;
-static const uint8_t PIN_STATUS_LED_RED   = 12;
-static const uint8_t PIN_BUZZER           = 11;
-static const uint8_t PIN_VALVE_SERVO_AIR   = 9;   // PWM-capable
-static const uint8_t PIN_VALVE_SERVO_WATER = 10;  // PWM-capable
+// --- Digital outputs: status LEDs (active HIGH, in series with 220-330 ohm) ---
+static const uint8_t PIN_LED_RED    = 52;  // fault / E-stop active
+static const uint8_t PIN_LED_GREEN  = 50;  // armed / nominal
+static const uint8_t PIN_LED_YELLOW = 48;  // warning (approaching limits, valve in transit)
+static const uint8_t PIN_LED_BLUE   = 46;  // discharge active
+static const uint8_t PIN_LED_WHITE  = 44;  // charge active (pump or compressor running)
 
-// --- Digital inputs (UNCHANGED) ---
-static const uint8_t PIN_ESTOP           = 2;   // INT0 — must be interrupt-capable
-static const uint8_t PIN_HALL_RPM_AIR    = 3;   // INT1 — hall at gearbox output (air side)
-static const uint8_t PIN_HALL_RPM_WATER  = 18;  // INT5 — hall at gearbox output (water side)
-static const uint8_t PIN_HALL_RPM_ALT    = 19;  // INT4 — hall at alternator shaft
-static const uint8_t PIN_ARM_SWITCH      = 30;
-static const uint8_t PIN_MANUAL_RESET    = 31;
+// --- Digital output: piezo buzzer ---
+static const uint8_t PIN_PIEZO      = 42;  // fault tone, brief beep on fault edge
+
+// --- Digital outputs: MOSFET-driven loads ---
+// MOSFET 1 (d45) -> 12V relay coil -> compressor contactor (AC mains).
+// MOSFET 2 (d43) -> 12V relay coil -> pump contactor (AC mains).
+// MOSFET 3 (d41) -> air pulse-rate solenoid (PID-modulated, <= MAX_PULSE_HZ).
+// MOSFET 4 (d39) -> air on/off arm solenoid (open during DISCHARGE_AIR/BOTH).
+// All four follow the low-side N-channel pattern from mosfet_test_uno.
+static const uint8_t PIN_MOSFET_COMP_CONT  = 45;  // MOSFET 1
+static const uint8_t PIN_MOSFET_PUMP_CONT  = 43;  // MOSFET 2
+static const uint8_t PIN_MOSFET_AIR_PULSE  = 41;  // MOSFET 3 -- pulse-rate PID drives this
+static const uint8_t PIN_MOSFET_AIR_ARM    = 39;  // MOSFET 4 -- on/off arm
+
+// --- Digital output: water proportional valve drive (PWM -> 0-10V converter) ---
+// PWM-capable on Mega Timer1. Drives the HSH-Flo green wire via a calibrated
+// PWM-to-0-10V converter. Code path lifted from prop_valve_test_uno.
+static const uint8_t PIN_WATER_VALVE_PWM   = 9;
+
+// --- Digital inputs: interrupt-capable pins ---
+// d2 (INT0): alt encoder channel A
+// d3 (INT1): alt encoder channel B (only needed for direction; RPM works on A alone)
+// d18 (INT5): E-stop. INPUT_PULLUP, NC contact between pin and GND. Fail-safe.
+// d19 (INT4): water-side bevel pinion hall (OPTIONAL; see HAVE_WATER_HALL below).
+static const uint8_t PIN_ALT_ENCODER_A     = 2;
+static const uint8_t PIN_ALT_ENCODER_B     = 3;
+static const uint8_t PIN_ESTOP             = 18;
+static const uint8_t PIN_HALL_WATER        = 19;
+
+// --- Digital input: water valve OC-PWM position feedback ---
+// White wire from HSH-Flo. External 10k pull-up to 5V (per prop_valve_test_uno).
+// Read via pulseIn() in loop -- no interrupt needed.
+static const uint8_t PIN_WATER_VALVE_FB    = 4;
+
+// --- Digital inputs: operator-panel switches (all INPUT_PULLUP, closed = LOW) ---
+// All five wired identically: pin -> switch -> GND. Fail-safe to "off"
+// (cut wire reads HIGH -> disarmed/disabled).
+// CHARGE and DISCHARGE are PERMISSIVE: ON means the firmware is *allowed*
+// to actuate the corresponding loads when ARM and MODE_* also agree and
+// no faults are active. They are not direct triggers.
+static const uint8_t PIN_SW_DISCHARGE      = 29;
+static const uint8_t PIN_SW_CHARGE         = 31;
+static const uint8_t PIN_SW_MODE_WATER     = 33;
+static const uint8_t PIN_SW_MODE_AIR       = 35;
+static const uint8_t PIN_SW_ARM            = 37;
+
+// --- I2C: MS5837 lower-tank hydrostatic sensor ---
+// d20 = SDA, d21 = SCL. Consumes INT3 and INT2 (not available for other use).
+// Sensor wired to 3.3V (NOT 5V). Pull-ups: 10k to 3.3V if breakout lacks them.
+// Model is MS5837_02BA -- library requires setModel(MS5837_02BA) explicitly.
 
 // --- Analog inputs ---
-// >>> CHANGED: PIN_PRESSURE_XDUCR renamed to PIN_PRESSURE_P1 (compressor outlet).
-// >>> NEW:     PIN_PRESSURE_P2 added (downstream of air servo reg, motor inlet).
-static const uint8_t PIN_PRESSURE_P1     = A0;  // upstream of solenoid (was PIN_PRESSURE_XDUCR)
-static const uint8_t PIN_CURRENT_12V     = A1;
-static const uint8_t PIN_CURRENT_5V      = A2;
-static const uint8_t PIN_BUS_VOLTAGE     = A3;
-static const uint8_t PIN_ALT_VOLTAGE     = A4;
-static const uint8_t PIN_ALT_CURRENT     = A5;  // ACS712 between rectifier and load
-static const uint8_t PIN_CURRENT_COMP    = A6;  // SCT-013 clamp on compressor mains
-static const uint8_t PIN_CURRENT_PUMP    = A7;  // SCT-013 clamp on pump mains
-static const uint8_t PIN_VALVE_ENC_AIR   = A8;  // optional servo angle feedback
-static const uint8_t PIN_VALVE_ENC_WATER = A9;  // optional servo angle feedback
-static const uint8_t PIN_PRESSURE_P2     = A10; // NEW: motor-inlet pressure (read-only)
+// >>> CHANGED: this map drops bus voltage, 5V-bus current, alt-shaft hall,
+// >>>          and the second ACS712. Pre-pivot pins NOT to repurpose without
+// >>>          schematic check.
+static const uint8_t PIN_V_ALT             = A9;   // voltage sensor on post-rectifier load bus
+static const uint8_t PIN_I_LOAD            = A10;  // ACS712-20A between rectifier and load
+static const uint8_t PIN_P1_VESSEL         = A13;  // Fusch 200 psi -- upstream of arm solenoid
+static const uint8_t PIN_P2_MOTOR          = A12;  // Fusch 100 psi -- downstream of pulse solenoid
+static const uint8_t PIN_I_PUMP            = A14;  // SCT-013 around pump mains
+static const uint8_t PIN_I_COMP            = A15;  // SCT-013 around compressor mains
+// a8, a11 intentionally unassigned (former V #2 and ACS #2, both dropped).
+
+// --- Compile-time toggles for optional channels ---
+// Water hall is the last piece of OWB engagement detection we have. At PoC
+// scope, dispatch can run without it -- water-only is the regulated path and
+// air can't lock its OWB at 350-500 RPM anyway. Default OFF; flip to true
+// when the hall is wired and engagement detection is back in scope.
+static const bool HAVE_WATER_HALL          = false;
 
 // ============================================================================
 // 2. CALIBRATION CONSTANTS
 // ============================================================================
-// >>> CHECK each one against the actual installed component before trusting.
+// >>> CHECK each one on bench before trusting. Numbers carried over from the
+// >>> validated test sketches noted in each subsection.
 
+// --- ADC ---
 static const float    ADC_REF_V   = 5.0f;
 static const uint16_t ADC_COUNTS  = 1023;
 
-// --- Pressure transducers ---
-// Assumed standard industrial 0.5–4.5V output.
-// >>> MEASURE: actual V at 0 psi for each transducer on bench. If they differ
-// >>>          by >50 mV from datasheet, override the per-channel offset here.
-static const float PRESSURE_V_MIN = 0.5f;
-static const float PRESSURE_V_MAX = 4.5f;
+// --- Fusch pressure transducers (from pressure_fusch_100psi_test_uno + 200) ---
+// Both are 3-wire ratiometric 0.5-4.5 V.
+static const float PRESSURE_V_MIN  = 0.5f;
+static const float PRESSURE_V_MAX  = 4.5f;
+static const float P1_FS_PSI       = 200.0f;   // vessel-side sensor
+static const float P2_FS_PSI       = 100.0f;   // motor-inlet sensor
+static const float P1_NOISE_FLOOR  = 0.20f;    // psi -- clamp tiny readings to 0
+static const float P2_NOISE_FLOOR  = 0.10f;
+// NOTE: vented-static venting effect is a real flow-dynamic artifact, not a
+// calibration issue. With the motor connected and drawing flow, P2 reads true
+// static pressure at the motor inlet (which is the control variable). See
+// thread notes 2026-06-04 for details. No correction in firmware.
 
-// >>> DECIDE: full-scale range per transducer.
-//   P1 must cover vessel pressure (~85 psi P_MAX) with margin → 150 psi sensor.
-//   P2 only sees post-manual-reg (≤56.5 psi) — a 100 psi sensor gives better
-//   resolution. Different parts OK; flag in BOM that they aren't interchangeable.
-static const float P1_FS_PSI = 200.0f;
-static const float P2_FS_PSI = 100.0f;  // >>> DECIDE: smaller-range sensor for P2?
-
-// --- Voltage dividers ---
+// --- Voltage divider for V_alt (from voltage_sensor_test_uno) ---
+// Alt OC voltage can reach 24 V (free-spin); divider must keep ADC under 5 V.
 // >>> CALCULATE from actual resistor values, then verify with multimeter.
-static const float BUS_DIV_RATIO   = 4.0f;   // 12V bus → ~3V at ADC
-static const float ALT_V_DIV_RATIO = 10.0f;  // alt up to 50V → 5V max at ADC
+static const float ALT_V_DIV_RATIO = 10.0f;   // 24V -> 2.4V at ADC
 
-// --- Current sensors ---
-// Logic / parasitic side uses ACS712-5A (0.185 V/A — better resolution at low I).
-// Load side uses ACS712-20A (0.100 V/A — headroom for transient overshoots).
-// >>> VERIFY actual ACS712 variant on each physical channel.
-static const float CURRENT_GAIN_12V_BUS = 0.185f;  // ACS712-5A on 12V control rail
-static const float CURRENT_GAIN_5V_BUS  = 0.185f;  // ACS712-5A on 5V logic rail
-static const float CURRENT_GAIN_ALT     = 0.100f;  // ACS712-20A between rectifier and load
+// --- ACS712 (load side, from acs712_test_uno) ---
+// ACS712-20A: 0.100 V/A. ACS712-5A would be 0.185 V/A -- VERIFY part installed.
+static const float CURRENT_GAIN_LOAD = 0.100f;
+// Zero-current output voltage. ACS712 spec is 2.5 V +/- 25 mV.
+// >>> MEASURE on bench with primary disconnected, store in EEPROM addr 6.
+static const float CURRENT_OFFSET_DC_V = 2.5f;   // fallback if EEPROM uninitialized
 
-// Clamp CTs on AC mains for compressor and pump (round-trip input-energy side).
-// >>> DECIDE clamp model. SCT-013-030 (0.033 V/A) is common; SCT-013-000 needs a
-// >>>        burden resistor and different math entirely.
-static const float CURRENT_GAIN_COMP = 0.033f;  // >>> PLACEHOLDER
-static const float CURRENT_GAIN_PUMP = 0.033f;  // >>> PLACEHOLDER
+// --- SCT-013 clamp CTs (from sct013_030_test_uno) ---
+// >>> DECIDE which SCT-013 model. SCT-013-030 has internal burden -> 0.033 V/A.
+// >>> SCT-013-000 needs external burden + different math entirely.
+static const float CURRENT_GAIN_PUMP = 0.033f;   // >>> PLACEHOLDER until SCT model confirmed
+static const float CURRENT_GAIN_COMP = 0.033f;
+static const float CURRENT_OFFSET_AC_V = 0.0f;   // AC clamps read 0 at zero current
 
-// Zero-current output voltage.
-// >>> MEASURE per sensor with primary disconnected. ACS712 spec is 2.5V ±25mV;
-// >>>        AC clamp CTs are AC-coupled and read 0V at zero.
-static const float CURRENT_OFFSET_DC_V = 2.5f;   // ACS712 (DC hall)
-static const float CURRENT_OFFSET_AC_V = 0.0f;   // SCT-013 (AC clamp)
+// --- Alt encoder (from encoder_test_uno) ---
+// QIWO QW86Y2H03L30 shipped with a 5-wire encoder. CPR = 4.
+static const uint8_t ALT_ENCODER_CPR = 4;
 
-// --- RPM ---
-// >>> COUNT actual magnets installed on each shaft.
-// >>> TODO: move these to EEPROM (firmware_conventions.md memory) so they
-// >>>       can be set per-rig without reflashing.
-static const uint8_t PULSES_PER_REV_AIR   = 2;
+// --- Water-side hall (from hall_test_uno, only if HAVE_WATER_HALL) ---
+// >>> COUNT actual magnets installed on the bevel pinion if/when this is wired.
 static const uint8_t PULSES_PER_REV_WATER = 2;
-static const uint8_t PULSES_PER_REV_ALT   = 2;
+
+// --- Water valve OC-PWM feedback (from prop_valve_test_uno bench cal) ---
+static const float FB_DUTY_CLOSED_PCT = 4.9f;
+static const float FB_DUTY_OPEN_PCT   = 93.5f;
+static const float VALVE_FULL_SCALE_V = 10.0f;   // converter output at 100% PWM duty
+
+// --- MS5837 (from ms5837_cal_mega) ---
+// Sensor model is -02BA. Library does NOT autodetect -- call setModel(MS5837_02BA).
+static const float FLUID_DENSITY_KG_M3 = 997.0f;   // freshwater @ ~25 C
+static const float GRAVITY_M_S2        = 9.80665f;
+static const float ATM_DEFAULT_MBAR    = 1013.25f; // fallback when EEPROM uninitialized
 
 // ============================================================================
 // 3. OPERATING SETPOINTS
 // ============================================================================
 
-// --- Target output voltage (PoC target = 12V) ---
-// Pi can override at runtime via v_setpoint_cV in the Command struct.
-static const float V_SETPOINT_DEFAULT_V = 12.0f;
+// --- Target output voltage ---
+// Single setpoint, Pi-overridable via Command.v_setpoint_cV (centivolts).
+// Mega EEPROM (addr 10) holds the boot default; Pi can change at runtime.
+// PoC mode-specific guidance (Pi picks based on MODE_* switch state):
+//   water-only or both:   8.00 V  (loaded water peak is below the old 10-12 V
+//                                  free-flow estimate -- 8 V is honest target)
+//   air-only:             4.00 V  (alt @ ~310 RPM, well below cut-in --
+//                                  demonstrates loop is alive, not useful power)
+// Boot default below is the conservative one: safer than 12 V if Pi hasn't
+// connected yet (loop can actually reach 8 V; would saturate forever at 12 V).
+static const int16_t V_SETPOINT_DEFAULT_CV = 800;   // 8.00 V
 
 // --- Pressure targets ---
-// The vessel can hold higher pressure than the NRL-8K motor can consume.
-// Manual reg drops vessel → motor inlet.
-// >>> CONFIRM manual reg is physically adjusted to ≤50 psi output.
-//
-// >>> DECIDE: vessel charge target. 80 psi gives margin below P_VESSEL_MAX
-// >>>         and well above what the manual reg passes through.
-//             Start LOW (~40 psi) for first hot tests, work up.
-static const float P_VESSEL_CHARGE_TARGET_PSI = 80.0f;
-
-// Vessel hard ceiling — protects tank, fittings, plumbing.
-// >>> BLOCKED: Brennan to confirm against actual tank's rated pressure.
-// >>>          Set to ~80% of weakest component's burst rating.
-static const float P_VESSEL_MAX_PSI = 85.0f;  // >>> PLACEHOLDER
-
-// Motor inlet hard ceiling — protects NRL-8K vanes/seals.
-// LOCKED at datasheet value; do not raise.
-static const float P_MOTOR_MAX_PSI = 56.5f;
-
-// "System is vented / safe" threshold used in shutdown logic.
-static const float P_SAFE_VENT_PSI = 5.0f;
-
-// Sanity range for pressure sensor readings (detects sensor disconnection).
-static const float P_SANITY_LO_PSI = -2.0f;
-static const float P_SANITY_HI_PSI = 200.0f;
-
-// --- Electrical bus limits ---
-// >>> DECIDE based on actual measured draw with everything energized.
-static const float V_BUS_MIN     = 11.0f;
-static const float I_BUS_MAX_12V = 8.0f;
-static const float I_BUS_MAX_5V  = 2.0f;
+static const float P_VESSEL_CHARGE_TARGET_PSI = 80.0f;  // >>> DECIDE, start LOW (~40) for first tests
+static const float P_VESSEL_MAX_PSI            = 85.0f; // >>> BLOCKED: Brennan, ~80% of weakest fitting
+static const float P_MOTOR_MAX_PSI             = 56.5f; // LOCKED -- NRL-8K datasheet
+static const float P_SAFE_VENT_PSI             = 5.0f;
+static const float P_SANITY_LO_PSI             = -2.0f;
+static const float P_SANITY_HI_PSI             = 250.0f;
 
 // ============================================================================
 // 4. FAULT THRESHOLDS
 // ============================================================================
 // >>> DECIDE every value here is a placeholder; measure on bench before trusting.
 
-// --- Overvoltage (asymmetric: closes servos faster than opens) ---
-// Hardware crowbar fires at ~16V. Firmware must close servos before that.
-static const float    V_OVERVOLTAGE_SOFT_V             = 13.5f;  // sustained
-static const float    V_OVERVOLTAGE_HARD_V             = 14.5f;  // instantaneous
-static const uint16_t V_OVERVOLTAGE_SOFT_DURATION_MS   = 100;
+// --- Overvoltage (asymmetric: closes actuators faster than opens) ---
+// Hardware crowbar fires at ~16 V. Firmware must shut down before that.
+static const float    V_OVERVOLTAGE_SOFT_V            = 13.5f;
+static const float    V_OVERVOLTAGE_HARD_V            = 14.5f;
+static const uint16_t V_OVERVOLTAGE_SOFT_DURATION_MS  = 100;
 
-// --- V droop fault (graceful droop tolerated up to this point) ---
-// Triggers only when both sides are saturated and V is still falling — i.e.,
-// physics-limited delivery, not a control-loop bug.
-static const float    V_DROOP_FAULT_FRAC               = 0.70f;  // V_alt < 70% of setpoint
-static const uint16_t V_DROOP_FAULT_DURATION_MS        = 2000;
+// --- V droop fault (graceful droop tolerated, this is the "real failure" line) ---
+// Triggers only when both sides are saturated and V is still falling.
+static const float    V_DROOP_FAULT_FRAC              = 0.70f;
+static const uint16_t V_DROOP_FAULT_DURATION_MS       = 2000;
 
 // --- Overspeed ---
-// >>> DECIDE: actual mechanical limit of alternator + drivetrain.
-// >>>         BLDC datasheet should give max RPM; bearings may be the real limit.
-static const float ALT_RPM_WARN  = 2500.0f;
-static const float ALT_RPM_FAULT = 3000.0f;
+// >>> DECIDE: alt + drivetrain mechanical limit. QIWO datasheet gives BLDC RPM
+// >>>         max; bearings likely the real limit.
+static const float ALT_RPM_WARN   = 2500.0f;
+static const float ALT_RPM_FAULT  = 3000.0f;
 
-// --- Leak detection (compound: only fires during S_CHARGE_AIR) ---
-static const uint16_t LEAK_CHARGE_GRACE_MS      = 5000;   // ignore first 5s of charge
-static const float    LEAK_P_GATE_FRAC          = 0.80f;  // only check P1 < 80% of target
-static const float    LEAK_MIN_PSI_PER_S        = 1.0f;   // dP/dt below this = stalled
-static const uint16_t LEAK_FAULT_DURATION_MS    = 10000;  // sustained 10s
+// --- Air-side leak (only fires during charge: compressor on, arm solenoid closed) ---
+static const uint16_t LEAK_CHARGE_GRACE_MS    = 5000;
+static const float    LEAK_P_GATE_FRAC        = 0.80f;
+static const float    LEAK_MIN_PSI_PER_S      = 1.0f;
+static const uint16_t LEAK_FAULT_DURATION_MS  = 10000;
 
-// --- P2-stuck fault (servo commanded motion but P2 not responding) ---
-static const float    P2_STUCK_SERVO_DELTA_DEG    = 20.0f;
-static const float    P2_STUCK_PRESSURE_DELTA_PSI = 0.5f;
-static const uint16_t P2_STUCK_WINDOW_MS          = 3000;
+// --- P2-stuck fault (pulse rate commanded > 0 but P2 not responding) ---
+// Reworded from the servo-era version. Applies during DISCHARGE_AIR with
+// arm solenoid open and pulse rate non-zero.
+static const float    P2_STUCK_MIN_PULSE_HZ          = 1.0f;
+static const float    P2_STUCK_PRESSURE_DELTA_PSI    = 0.5f;
+static const uint16_t P2_STUCK_WINDOW_MS             = 3000;
 
 // --- Pi heartbeat (energized states only) ---
 static const uint16_t PI_HEARTBEAT_TIMEOUT_MS = 2000;
 
-// --- Generic fault debounce (single-sample noise rejection) ---
+// --- Generic fault debounce ---
 static const uint16_t FAULT_DEBOUNCE_MS = 50;
+
+// --- Switch / E-stop debounce ---
+static const uint16_t SWITCH_DEBOUNCE_MS = 30;   // matches estop_arm_test_mega
 
 // ============================================================================
 // 5. GEAR RATIOS
 // ============================================================================
-// All ratios expressed as: upstream_RPM × ratio = downstream_RPM.
-// >>> VERIFY against actual installed gearboxes and bevel teeth.
+// Simplified vs. pre-pivot draft: NO gearboxes on either side in the PoC
+// build (decided to ship without them to meet presentation deadline).
+// Both sides drive their bevel pinion directly.
 
-// Air side: NRL-8K motor output → step-up gearbox → bevel pinion → alt bevel.
-// Sizing philosophy (memory: hardware_locked.md): place motor's peak-power RPM
-// (275) at alt cut-in RPM (~750) so the motor has room to slow under load.
-// 275 × 2.7 ≈ 743 ≈ alt cut-in.
-static const float GEAR_RATIO_AIR_GBOX = 2.7f;   // motor RPM × this = bevel pinion RPM
-                                                  // >>> CONFIRM after gearbox is in hand
+// Air side: NRL-8K motor output -> bevel pinion DIRECT.
+// Motor runs 350-500 RPM at operating point. At Kv=62, that's V_oc = 5.6..8.0 V.
+// Minus ~1.4 V rectifier drop = 4.2..6.6 V open-circuit; under load: lower.
+// This is why air-only target is 4 V, not 12 V -- it's "loop alive" demo.
+static const float GEAR_RATIO_AIR_GBOX = 1.0f;
 
-// Water side: BLOCKED on Philip's turbine choice.
-// >>> BLOCKED: water gear ratio depends on turbine design RPM.
-static const float GEAR_RATIO_WATER_GBOX = 1.0f; // >>> PLACEHOLDER
+// Water side: turbine -> bevel pinion DIRECT.
+// >>> CAVEAT: previous "10-12 V achievable" estimate was free-flow turbine
+// >>>         RPM under NO LOAD. Loaded RPM will be lower (turbine extracts
+// >>>         torque from the flow). Real ceiling under V-regulated load is
+// >>>         likely below 12 V -- consider lowering V_SETPOINT_DEFAULT_CV
+// >>>         once bench numbers are in.
+static const float GEAR_RATIO_WATER_GBOX = 1.0f;
 
-// Bevel ratio: alt-bevel-gear teeth / pinion teeth.
-// pinion_RPM (when OWB locked) = alt_RPM × this.
-// E.g., 30T alt-bevel + 15T pinion → ratio = 2.0.
-// >>> VERIFY teeth count once bevel pair is selected.
+// Bevel ratio: alt-bevel teeth / pinion teeth. >>> BLOCKED: bevel pair selection.
 static const float BEVEL_TEETH_RATIO = 1.0f;     // >>> PLACEHOLDER
 
-// BLDC Kv for V-regulation predictions and feed-forward.
-// QIWO QW86Y2H03L30 — locked.
+// BLDC Kv. LOCKED.
 static const float ALT_KV_RPM_PER_V = 62.0f;
 
-// Estimated rectifier diode forward drop (passive 3φ bridge, both diodes in path).
-// >>> MEASURE under load — datasheet typical for 1N5408-class diodes.
+// Passive 3-phase bridge forward drop (typical 1N5408-class).
+// >>> MEASURE under load.
 static const float RECTIFIER_VDROP_V = 1.4f;
 
 // ============================================================================
 // 6. DISPATCH & ENGAGEMENT
 // ============================================================================
-// Auto-allocator hysteresis and OWB engagement thresholds.
-// See memory: control_architecture.md for rationale.
+// Dispatch rules use water-valve POSITION FEEDBACK (white-wire pulseIn),
+// not commanded position -- the valve takes ~7.5 s to traverse 0-100%, so
+// "commanded > 80%" would fire while the valve is still in transit.
+// (See prop_valve_dynamics memory.)
 
-// --- Add-air trigger (water saturated AND V error positive) ---
-static const float    DISPATCH_ADD_AIR_VALVE_FRAC   = 0.80f;  // water valve >80% open
-static const float    DISPATCH_ADD_AIR_V_ERR_V      = 0.5f;   // AND V error > 0.5V
-static const uint16_t DISPATCH_ADD_AIR_DURATION_MS  = 2000;
+// --- Add-air trigger ---
+static const float    DISPATCH_ADD_AIR_VALVE_PCT     = 80.0f;  // water FB position
+static const float    DISPATCH_ADD_AIR_V_ERR_V       = 0.5f;
+static const uint16_t DISPATCH_ADD_AIR_DURATION_MS   = 2000;
 
-// --- Drop-air trigger (air no longer needed) ---
-static const float    DISPATCH_DROP_AIR_VALVE_FRAC  = 0.10f;  // air valve <10% open
-static const uint16_t DISPATCH_DROP_AIR_DURATION_MS = 5000;   // wider band → no flap
+// --- Drop-air trigger (wider band to avoid flapping) ---
+// "Air not needed" on the pulse-rate side = commanded pulse rate near zero.
+static const float    DISPATCH_DROP_AIR_PULSE_HZ     = 0.5f;
+static const uint16_t DISPATCH_DROP_AIR_DURATION_MS  = 5000;
 
 // --- OWB engagement detection ---
-// Hysteresis: lock at 95% of alt-locked RPM, disengage at 85%.
-// Mismatch (>120%) = unsafe to engage, would slam OWB.
+// DISABLED in PoC scope (HAVE_WATER_HALL = false). If reinstated, compare
+// water hall RPM * bevel ratio vs alt RPM with these fractions.
 static const float ENGAGE_LOCK_FRAC      = 0.95f;
 static const float ENGAGE_DISENGAGE_FRAC = 0.85f;
 static const float ENGAGE_MISMATCH_FRAC  = 1.20f;
@@ -265,56 +310,71 @@ static const float ENGAGE_MISMATCH_FRAC  = 1.20f;
 // ============================================================================
 // 7. PID GAINS
 // ============================================================================
-// One PI controller per discharge side. D-term is 0 by default — V_alt is
-// noisy enough that derivative kicks the output around without helping.
+// Two PI controllers, one per side. Both regulate V_alt. Different actuators:
+//   - water: continuous valve position (0..100 %)
+//   - air:   discrete pulse rate (0..MAX_PULSE_HZ)
 //
-// >>> TUNE: placeholders are conservative (slow, won't oscillate). Tune via
-// >>>       hand-tuning: raise Kp until oscillation, back off to ~60%, set
-// >>>       Ki ≈ Kp / 4. Re-tune after R_LL bench measurement updates the
-// >>>       expected droop slope.
+// Both lift their structure from validated test sketches:
+//   - water gains/anti-windup model: derived for the 7-10 s prop valve
+//   - air gains/anti-windup model:   lifted from mosfet_fusch_pid_uno
+//     (error swapped from psi to V, output stays Hz)
+//
+// >>> TUNE: placeholders are conservative. Tune on bench. Hand-tune Kp to
+// >>>       oscillation, back off to ~60 %, then set Ki ~ Kp/4. D stays 0.
 
-// --- Air side ---
-static const float PID_AIR_KP            = 8.0f;    // servo deg per V of error
-static const float PID_AIR_KI            = 2.0f;    // servo deg per V·s
-static const float PID_AIR_KD            = 0.0f;
-static const float PID_AIR_OUT_MIN_DEG   = 15.0f;   // >>> CHECK: NRL-8K min vane-seat angle
-static const float PID_AIR_OUT_MAX_DEG   = 170.0f;  // mechanical travel limit
-static const float PID_AIR_SLEW_DEG_PER_S = 90.0f;  // opening rate cap
+// --- Water PID (V_alt -> valve %) ---
+// Bandwidth ceiling is the actuator: ~10 s full travel -> << 0.016 Hz BW.
+// Mandatory anti-windup using FB position (freeze integral while
+// |commanded - feedback| > WATER_VALVE_SLEW_BAND_PCT).
+static const float    PID_WATER_KP            = 7.0f;    // %/V
+static const float    PID_WATER_KI            = 1.5f;    // %/(V*s)
+static const float    PID_WATER_KD            = 0.0f;
+static const float    PID_WATER_OUT_MIN_PCT   = 0.0f;
+static const float    PID_WATER_OUT_MAX_PCT   = 100.0f;
+static const float    PID_WATER_INTEGRAL_MAX  = 50.0f;
+static const float    PID_WATER_INTEGRAL_MIN  = -50.0f;
+static const float    PID_WATER_DEADBAND_V    = 0.1f;
+static const uint16_t PID_WATER_UPDATE_MS     = 200;     // 5 Hz update -- well above valve BW
+static const float    WATER_VALVE_SLEW_PCT_PER_S = 10.0f; // measured cap
+static const float    WATER_VALVE_SLEW_BAND_PCT  = 5.0f;  // anti-windup window
 
-// --- Water side ---
-static const float PID_WATER_KP            = 12.0f;
-static const float PID_WATER_KI            = 3.0f;
-static const float PID_WATER_KD            = 0.0f;
-static const float PID_WATER_OUT_MIN_DEG   = 0.0f;  // water valve can fully close while running
-static const float PID_WATER_OUT_MAX_DEG   = 170.0f;
-static const float PID_WATER_SLEW_DEG_PER_S = 60.0f;
+// --- Air pulse-rate PID (V_alt -> pulse Hz) ---
+// MAX_PULSE_HZ ceiling protects the solenoid mechanical spec.
+// PULSE_WIDTH_MS is operator-set; PID modulates frequency only.
+static const float    PID_AIR_KP              = 1.0f;    // Hz/V
+static const float    PID_AIR_KI              = 0.2f;    // Hz/(V*s)
+static const float    PID_AIR_KD              = 0.0f;
+static const float    PID_AIR_INTEGRAL_MAX    = 50.0f;
+static const float    PID_AIR_INTEGRAL_MIN    = -50.0f;
+static const float    PID_AIR_DEADBAND_V      = 0.1f;
+static const float    PID_AIR_MIN_USEFUL_HZ   = 0.25f;   // below this -> just close
+static const uint16_t PID_AIR_UPDATE_MS       = 200;     // matches mosfet_fusch_pid_uno
 
-// --- Closure target (used by overvoltage handler and SHUTDOWN entry) ---
-static const float SERVO_ANGLE_CLOSED_DEG = 0.0f;
+static const float    AIR_MAX_PULSE_HZ        = 5.0f;    // solenoid mechanical spec
+static const uint16_t AIR_PULSE_WIDTH_MS      = 200;     // >>> TUNE on bench with motor
+
+// --- Closure targets (used by overvoltage handler and SHUTDOWN entry) ---
+static const float    WATER_VALVE_CLOSED_PCT  = 0.0f;
+static const float    AIR_PULSE_OFF_HZ        = 0.0f;
 
 // ============================================================================
 // 8. LOOP RATES
 // ============================================================================
-// UNCHANGED from current TestStandFirmware.ino.
-
 static const uint16_t LOOP_PERIOD_MS = 10;    // 100 Hz main loop
-static const uint16_t LOG_PERIOD_MS  = 100;   // 10 Hz telemetry
+static const uint16_t LOG_PERIOD_MS  = 100;   // 10 Hz telemetry to Pi
 
 // ============================================================================
 // 9. EEPROM LAYOUT
 // ============================================================================
-// Boot-time-critical calibration only. Everything else lives in Pi config.
-// >>> NEW: reserved addresses for ACS712 zero offsets and per-side PPR
-// >>>      (not yet implemented in setup/cal flow — wire up next refactor).
+// Mega scope: boot-time-critical calibration only. Everything else is in Pi
+// config (gear ratios, fault thresholds, dispatch constants, session metadata).
+// Address map kept compact -- room to grow.
 
-static const int      EEPROM_CAL_MAGIC_ADDR = 0;   // 2 bytes
-static const int      EEPROM_CAL_ATM_ADDR   = 2;   // 4 bytes — MS5837 atm offset (float)
-static const int      EEPROM_ACS_OFFSET_12V = 6;   // 4 bytes float — NEW
-static const int      EEPROM_ACS_OFFSET_5V  = 10;  // 4 bytes float — NEW
-static const int      EEPROM_ACS_OFFSET_ALT = 14;  // 4 bytes float — NEW
-static const int      EEPROM_PPR_AIR        = 18;  // 1 byte — NEW
-static const int      EEPROM_PPR_WATER      = 19;  // 1 byte — NEW
-static const int      EEPROM_PPR_ALT        = 20;  // 1 byte — NEW
+static const int      EEPROM_CAL_MAGIC_ADDR     = 0;   // 2 bytes uint16
+static const int      EEPROM_CAL_ATM_ADDR       = 2;   // 4 bytes float -- MS5837 atm offset (mbar)
+static const int      EEPROM_ACS_LOAD_OFFSET    = 6;   // 4 bytes float -- ACS712 zero (volts)
+static const int      EEPROM_V_SETPOINT_CV      = 10;  // 2 bytes int16  -- V setpoint default (centivolts)
+// addr 12 onward reserved for future cal slots (e.g. SCT burden, encoder cal).
 
 static const uint16_t EEPROM_CAL_MAGIC = 0xCA1B;
 

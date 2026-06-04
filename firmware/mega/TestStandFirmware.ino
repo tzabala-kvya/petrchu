@@ -159,12 +159,17 @@ static const float ATM_DEFAULT_MBAR    = 1013.25f;
 static const int16_t V_SETPOINT_DEFAULT_CV = 800;
 
 // Pressure targets
-static const float P_VESSEL_CHARGE_TARGET_PSI = 80.0f;
-static const float P_VESSEL_MAX_PSI           = 85.0f;   // >>> BLOCKED: Brennan
+static const float P_VESSEL_CHARGE_TARGET_PSI = 100.0f;  // compressor auto-stops here
+static const float P_VESSEL_MAX_PSI           = 120.0f;  // >>> BLOCKED: Brennan (must stay > target)
 static const float P_MOTOR_MAX_PSI            = 56.5f;   // LOCKED NRL-8K
 static const float P_SAFE_VENT_PSI            = 5.0f;
 static const float P_SANITY_LO_PSI            = -2.0f;
 static const float P_SANITY_HI_PSI            = 250.0f;
+
+// Lower-tank depth at which the pump auto-stops during water charging.
+// Lower tank is the same size as upper; when lower drains to ~6 cm, upper
+// is full. Sits 1 cm above the cavitation fault floor for graceful stop.
+static const float P_TANK_CHARGED_DEPTH_CM = 6.0f;
 
 // ============================================================================
 // 4. FAULT THRESHOLDS
@@ -1345,10 +1350,21 @@ void commit_outputs() {
 
     // --- Hard interlocks (these override everything) ---
 
-    // Overpressure: kill charging immediately
+    // Overpressure: kill charging immediately (safety, not a target)
     if (g_sen.p1_vessel_psi > P_VESSEL_MAX_PSI) {
         comp = false;
         pump = false;
+    }
+
+    // Charge-complete auto-stops. These are NOT faults -- the system has
+    // simply reached the desired charge level. Operator should flip CHARGE
+    // off when this happens; if they don't, the comp/pump just stays idle
+    // and resumes if the level drops back below threshold (no hysteresis).
+    if (g_sen.p1_vessel_psi >= P_VESSEL_CHARGE_TARGET_PSI) {
+        comp = false;  // air vessel reached target
+    }
+    if (g_sen.depth_cm <= P_TANK_CHARGED_DEPTH_CM) {
+        pump = false;  // lower tank drained = upper tank full
     }
 
     // Soft overvoltage: drive V-regulating actuators closed fast

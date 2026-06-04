@@ -27,6 +27,7 @@ import argparse
 import sys
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import tkinter.font as tkfont
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -44,6 +45,12 @@ from teststand_logger import (
 
 REFRESH_MS    = 100   # UI tick (10 Hz matches telemetry)
 CHART_REDRAW_EVERY = 5   # redraw charts every 5 ticks = 2 Hz (saves CPU)
+
+# Monospace family. Resolved at TestStandUI init to the platform's actual
+# fixed-width font (Consolas on Windows; DejaVu Sans Mono on Pi/Linux).
+# Hardcoding "Consolas" broke labels and layout on Raspberry Pi OS because
+# the font is absent there and Tk fell back to a proportional font.
+MONO_FAMILY = "Consolas"
 
 # Dark theme
 C_BG     = "#1a1a2e"
@@ -91,12 +98,12 @@ class BigNumber(tk.Frame):
         self.warn_lo = warn_lo
         self.crit_lo = crit_lo
 
-        tk.Label(self, text=label, font=("Consolas", 9), fg=C_GRAY,
+        tk.Label(self, text=label, font=(MONO_FAMILY, 9), fg=C_GRAY,
                  bg=C_BG).pack(anchor="w", padx=4)
-        self._value = tk.Label(self, text="---", font=("Consolas", 22, "bold"),
+        self._value = tk.Label(self, text="---", font=(MONO_FAMILY, 22, "bold"),
                                fg=C_FG, bg=C_BG)
         self._value.pack(anchor="w", padx=4)
-        tk.Label(self, text=unit, font=("Consolas", 9), fg=C_GRAY,
+        tk.Label(self, text=unit, font=(MONO_FAMILY, 9), fg=C_GRAY,
                  bg=C_BG).pack(anchor="w", padx=4)
 
     def set(self, value):
@@ -133,9 +140,9 @@ class SwitchPanel(tk.Frame):
         super().__init__(parent, bg=C_BG)
         self._dots = {}
         for i, (lbl, key, on_color, off_color) in enumerate(self.SWITCHES):
-            tk.Label(self, text=lbl, font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+            tk.Label(self, text=lbl, font=(MONO_FAMILY, 8), fg=C_GRAY, bg=C_BG,
                      width=12).grid(row=0, column=i, padx=2)
-            d = tk.Label(self, text="●", font=("Consolas", 18), fg=off_color,
+            d = tk.Label(self, text="●", font=(MONO_FAMILY, 18), fg=off_color,
                          bg=C_BG)
             d.grid(row=1, column=i, padx=2)
             self._dots[key] = (d, on_color, off_color)
@@ -161,9 +168,9 @@ class OutputPanel(tk.Frame):
         super().__init__(parent, bg=C_BG)
         self._dots = {}
         for i, (lbl, key, on_c) in enumerate(self.OUTPUTS):
-            tk.Label(self, text=lbl, font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+            tk.Label(self, text=lbl, font=(MONO_FAMILY, 8), fg=C_GRAY, bg=C_BG,
                      width=12).grid(row=0, column=i, padx=2)
-            d = tk.Label(self, text="●", font=("Consolas", 18), fg=C_GRAY,
+            d = tk.Label(self, text="●", font=(MONO_FAMILY, 18), fg=C_GRAY,
                          bg=C_BG)
             d.grid(row=1, column=i, padx=2)
             self._dots[key] = (d, on_c)
@@ -236,16 +243,35 @@ class TestStandUI:
         self.root = tk.Tk()
         self.root.title("PetrChu Test Stand")
         self.root.configure(bg=C_BG)
-        self.root.geometry("1280x900")
+        # Conservative default for Pi displays. Fullscreen mode (--fullscreen)
+        # overrides this for the kiosk demo.
+        self.root.geometry("1024x720")
         if fullscreen:
             self.root.attributes("-fullscreen", True)
             self.root.bind("<Escape>", lambda e: self.root.destroy())
+
+        # Resolve a monospace font that exists on this platform. TkFixedFont
+        # maps to Consolas on Windows and DejaVu Sans Mono on Pi/Linux.
+        # Hardcoding "Consolas" caused fallback to a proportional font on the
+        # Pi, which threw off label widths in the operator/output panels.
+        global MONO_FAMILY
+        try:
+            MONO_FAMILY = tkfont.nametofont("TkFixedFont").actual("family")
+        except Exception:
+            pass
 
         self._mode  = None   # current UI mode string
         self._tick  = 0
         self._manual_on = False
 
         self._build_ui()
+
+        # Force initial geometry computation so the bottom widgets actually
+        # claim their space on first show. Without this, the dynamic mode
+        # panel sometimes grabs all vertical space at first draw and the
+        # bottom widgets are 0-height until the user resizes the window.
+        self.root.update_idletasks()
+
         self._schedule_refresh()
 
     # ---------------------------------------------------------------------
@@ -253,33 +279,36 @@ class TestStandUI:
     # ---------------------------------------------------------------------
 
     def _build_ui(self):
-        # Top bar: state badge + always-on big numbers + UI mode label
+        # IMPORTANT pack order: top widgets first (side=TOP), then bottom
+        # widgets (side=BOTTOM) so they reserve their space BEFORE the
+        # dynamic mode panel gets packed with expand=True later. If we pack
+        # the mode panel first, it grabs all remaining space and the bottom
+        # widgets render at 0 height until the window is resized.
+
+        # --- Top widgets (state badge, fault bar) ---
         self._build_top_bar()
 
-        # Fault bar (under top, shown only when faults active)
         self._fault_bar = tk.Label(self.root, text="",
-                                   font=("Consolas", 11, "bold"),
+                                   font=(MONO_FAMILY, 11, "bold"),
                                    fg=C_RED, bg=C_DARK, anchor="w")
-        self._fault_bar.pack(fill=tk.X, padx=6, pady=1)
+        self._fault_bar.pack(side=tk.TOP, fill=tk.X, padx=6, pady=1)
 
-        # IDLE panel (shown when no MODE switch is on)
+        # --- Bottom widgets (status footer, commands, status panels) ---
+        # Pack BEFORE the mode panel ever shows. Order matters: the FIRST
+        # side=BOTTOM widget ends up at the very bottom; subsequent ones
+        # stack upward from there.
+        self._status = tk.Label(self.root, text="Connecting...",
+                                font=(MONO_FAMILY, 8), fg=C_GRAY, bg=C_DARK,
+                                anchor="w")
+        self._status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._build_command_bar()     # packs side=BOTTOM internally
+        self._build_status_panels()   # packs side=BOTTOM internally
+
+        # --- Dynamic mode-specific panels (created here, packed by _set_mode) ---
         self._build_idle_panel()
-
-        # Mode-specific panels
         self._build_water_panel()
         self._build_air_panel()
-
-        # Bottom: switches, outputs, event log
-        self._build_status_panels()
-
-        # Commands: V setpoint slider + manual override
-        self._build_command_bar()
-
-        # Status footer
-        self._status = tk.Label(self.root, text="Connecting...",
-                                font=("Consolas", 8), fg=C_GRAY, bg=C_DARK,
-                                anchor="w")
-        self._status.pack(fill=tk.X)
 
     def _build_top_bar(self):
         top = tk.Frame(self.root, bg=C_BG)
@@ -287,7 +316,7 @@ class TestStandUI:
 
         # State badge
         self._state_label = tk.Label(top, text="---",
-                                     font=("Consolas", 20, "bold"),
+                                     font=(MONO_FAMILY, 20, "bold"),
                                      fg=C_FG, bg=C_ACCENT, width=18,
                                      relief=tk.RIDGE, borderwidth=2)
         self._state_label.pack(side=tk.LEFT, padx=4, ipady=8)
@@ -308,7 +337,7 @@ class TestStandUI:
 
         # UI mode label (right-aligned)
         self._mode_label = tk.Label(top, text="MODE: ---",
-                                    font=("Consolas", 14, "bold"),
+                                    font=(MONO_FAMILY, 14, "bold"),
                                     fg=C_GRAY, bg=C_BG)
         self._mode_label.pack(side=tk.RIGHT, padx=12)
 
@@ -316,12 +345,12 @@ class TestStandUI:
         self._idle_frame = tk.Frame(self.root, bg=C_ACCENT, height=200)
         # packed dynamically
         tk.Label(self._idle_frame, text="NO MODE SELECTED",
-                 font=("Consolas", 20, "bold"),
+                 font=(MONO_FAMILY, 20, "bold"),
                  fg=C_YELLOW, bg=C_ACCENT).pack(pady=(20, 4))
         tk.Label(self._idle_frame,
                  text="Flip MODE_AIR or MODE_WATER on the operator panel\n"
                       "to begin. Combine both for DISCHARGE_BOTH.",
-                 font=("Consolas", 11), fg=C_FG, bg=C_ACCENT,
+                 font=(MONO_FAMILY, 11), fg=C_FG, bg=C_ACCENT,
                  justify=tk.CENTER).pack(pady=4)
         self._idle_visible = False
 
@@ -384,7 +413,7 @@ class TestStandUI:
 
         # Dispatch banner (only shown in BOTH mode)
         self._dispatch_label = tk.Label(self._air_frame, text="",
-                                        font=("Consolas", 11, "bold"),
+                                        font=(MONO_FAMILY, 11, "bold"),
                                         fg=C_FG, bg=C_ACCENT, anchor="w")
         self._dispatch_label.pack(fill=tk.X, padx=4, pady=2)
 
@@ -404,38 +433,38 @@ class TestStandUI:
 
     def _build_status_panels(self):
         bottom = tk.Frame(self.root, bg=C_BG)
-        bottom.pack(fill=tk.X, padx=6, pady=4)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
 
         sw_frame = tk.LabelFrame(bottom, text="Operator panel",
-                                 font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+                                 font=(MONO_FAMILY, 9), fg=C_FG, bg=C_BG, bd=1)
         sw_frame.pack(side=tk.LEFT, padx=4, anchor="n")
         self._switch_panel = SwitchPanel(sw_frame)
         self._switch_panel.pack(padx=4, pady=4)
 
         out_frame = tk.LabelFrame(bottom, text="Actuator outputs",
-                                  font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+                                  font=(MONO_FAMILY, 9), fg=C_FG, bg=C_BG, bd=1)
         out_frame.pack(side=tk.LEFT, padx=4, anchor="n")
         self._output_panel = OutputPanel(out_frame)
         self._output_panel.pack(padx=4, pady=4)
 
         log_frame = tk.LabelFrame(bottom, text="Event log",
-                                  font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
+                                  font=(MONO_FAMILY, 9), fg=C_FG, bg=C_BG, bd=1)
         log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
         self._event_log = scrolledtext.ScrolledText(
-            log_frame, height=5, font=("Consolas", 8),
+            log_frame, height=5, font=(MONO_FAMILY, 8),
             bg=C_DARK, fg=C_FG, insertbackground=C_FG,
             state=tk.DISABLED, wrap=tk.WORD)
         self._event_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
     def _build_command_bar(self):
         bar = tk.LabelFrame(self.root, text="Commands (Pi -> Mega)",
-                            font=("Consolas", 9), fg=C_FG, bg=C_BG, bd=1)
-        bar.pack(fill=tk.X, padx=6, pady=4)
+                            font=(MONO_FAMILY, 9), fg=C_FG, bg=C_BG, bd=1)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
 
         # V setpoint slider + apply button
         vsp_frame = tk.Frame(bar, bg=C_BG)
         vsp_frame.pack(side=tk.LEFT, padx=8, pady=4)
-        tk.Label(vsp_frame, text="V setpoint", font=("Consolas", 9),
+        tk.Label(vsp_frame, text="V setpoint", font=(MONO_FAMILY, 9),
                  fg=C_FG, bg=C_BG).pack(anchor="w")
         self._vsp_var = tk.DoubleVar(value=8.0)
         self._vsp_scale = tk.Scale(vsp_frame, from_=1.0, to=15.0,
@@ -445,7 +474,7 @@ class TestStandUI:
                                    highlightthickness=0)
         self._vsp_scale.pack()
         tk.Button(vsp_frame, text="Apply (writes EEPROM)",
-                  font=("Consolas", 9, "bold"),
+                  font=(MONO_FAMILY, 9, "bold"),
                   fg=C_DARK, bg=C_YELLOW,
                   command=self._apply_vsp,
                   width=22).pack(pady=2)
@@ -457,7 +486,7 @@ class TestStandUI:
         tk.Checkbutton(man_frame, text="Manual override (diag only)",
                        variable=self._manual_var,
                        command=self._toggle_manual,
-                       font=("Consolas", 9, "bold"),
+                       font=(MONO_FAMILY, 9, "bold"),
                        fg=C_RED, bg=C_BG,
                        selectcolor=C_DARK,
                        activebackground=C_BG,
@@ -465,14 +494,14 @@ class TestStandUI:
         tk.Label(man_frame,
                  text="When ON, PIDs are off in discharge states and the\n"
                       "sliders below drive the actuators directly.",
-                 font=("Consolas", 8), fg=C_GRAY, bg=C_BG,
+                 font=(MONO_FAMILY, 8), fg=C_GRAY, bg=C_BG,
                  justify=tk.LEFT).pack(anchor="w")
 
         # Manual sliders
         sl_frame = tk.Frame(bar, bg=C_BG)
         sl_frame.pack(side=tk.LEFT, padx=12, pady=4)
 
-        tk.Label(sl_frame, text="Water valve %", font=("Consolas", 9),
+        tk.Label(sl_frame, text="Water valve %", font=(MONO_FAMILY, 9),
                  fg=C_FG, bg=C_BG).grid(row=0, column=0, sticky="w")
         self._water_man_var = tk.DoubleVar(value=0.0)
         self._water_slider = tk.Scale(sl_frame, from_=0, to=100, resolution=1,
@@ -483,7 +512,7 @@ class TestStandUI:
                                       command=lambda v: self._on_water_slider())
         self._water_slider.grid(row=0, column=1, padx=4)
 
-        tk.Label(sl_frame, text="Air pulse Hz", font=("Consolas", 9),
+        tk.Label(sl_frame, text="Air pulse Hz", font=(MONO_FAMILY, 9),
                  fg=C_FG, bg=C_BG).grid(row=1, column=0, sticky="w")
         self._air_man_var = tk.DoubleVar(value=0.0)
         self._air_slider = tk.Scale(sl_frame, from_=0, to=5, resolution=0.1,

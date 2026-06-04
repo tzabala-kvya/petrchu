@@ -200,12 +200,16 @@ static const float ATM_DEFAULT_MBAR    = 1013.25f; // fallback when EEPROM unini
 static const int16_t V_SETPOINT_DEFAULT_CV = 800;   // 8.00 V
 
 // --- Pressure targets ---
-static const float P_VESSEL_CHARGE_TARGET_PSI = 80.0f;  // >>> DECIDE, start LOW (~40) for first tests
-static const float P_VESSEL_MAX_PSI            = 85.0f; // >>> BLOCKED: Brennan, ~80% of weakest fitting
+static const float P_VESSEL_CHARGE_TARGET_PSI = 100.0f; // compressor auto-stops at this P1
+static const float P_VESSEL_MAX_PSI            = 120.0f;// >>> BLOCKED: Brennan; MUST stay above target
 static const float P_MOTOR_MAX_PSI             = 56.5f; // LOCKED -- NRL-8K datasheet
 static const float P_SAFE_VENT_PSI             = 5.0f;
 static const float P_SANITY_LO_PSI             = -2.0f;
 static const float P_SANITY_HI_PSI             = 250.0f;
+
+// Lower-tank depth at which the pump auto-stops (lower tank drained ==
+// upper tank full, since same volume). 1 cm above cavitation floor.
+static const float P_TANK_CHARGED_DEPTH_CM = 6.0f;
 
 // ============================================================================
 // 4. FAULT THRESHOLDS

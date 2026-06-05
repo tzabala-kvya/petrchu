@@ -1594,10 +1594,10 @@ void setup() {
     // Skipped on an air-only bench so a missing sensor doesn't stall boot.
     if (HAVE_DEPTH_SENSOR) ms5837_init();
 
-    // Watchdog
-    wdt_enable(WDTO_250MS);
-
-    // Self-test
+    // Self-test (BEFORE wdt_enable -- selftest's visual-ack blink takes
+    // ~480 ms when it passes, and we don't want a 250 ms watchdog killing
+    // the AVR mid-blink. Watchdog exists to catch main-loop hangs, not to
+    // bound boot time.)
     g_state = S_BOOT_SELFTEST;
     on_enter(g_state);
     if (!run_selftest()) {
@@ -1608,6 +1608,9 @@ void setup() {
         g_state = S_OFF;
         on_enter(g_state);
     }
+
+    // Watchdog arms only after selftest completes.
+    wdt_enable(WDTO_250MS);
 
     g_t_last_loop   = millis();
     g_t_last_log    = millis();

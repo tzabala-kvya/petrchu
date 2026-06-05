@@ -425,6 +425,12 @@ class CommandSender:
         hz = max(0.0, min(5.0, hz))
         self._send({"aph": int(round(hz * 100))})
 
+    def heartbeat(self):
+        """No-op message. Mega's handle_cmd() updates g_t_last_pi_msg on any
+        received line, so this prevents F_PI_LOST in energized states when the
+        operator isn't actively touching the UI controls."""
+        self._send({"hb": 1})
+
 
 # =========================================================================
 # LOGGER (top-level thread-safe interface)
@@ -464,6 +470,7 @@ class Logger:
         self._lock         = threading.Lock()
         self._running      = False
         self._thread       = None
+        self._hb_thread    = None
 
         # Serial open. If this fails, Logger init fails fast.
         self._ser = serial.Serial(port, baud, timeout=0.5)
@@ -477,6 +484,11 @@ class Logger:
         self._thread = threading.Thread(
             target=self._reader_loop, daemon=True, name="serial_reader")
         self._thread.start()
+        # Heartbeat thread: prevents F_PI_LOST in energized states. The Mega
+        # times out at 2 s; we send every 1 s for margin.
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="heartbeat")
+        self._hb_thread.start()
         print(f"[Logger] started on {self.port} @ {self.baud}")
         print(f"[Logger] session: {self.session_id}")
         print(f"[Logger] CSV:     {self._csv.telem_path}")
@@ -486,12 +498,22 @@ class Logger:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._hb_thread:
+            self._hb_thread.join(timeout=2.0)
         self._csv.close()
         try:
             self._ser.close()
         except Exception:
             pass
         print(f"[Logger] stopped. {self._csv.rows_written} rows written.")
+
+    def _heartbeat_loop(self):
+        while self._running:
+            try:
+                self.commander.heartbeat()
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     def get_latest(self):
         with self._lock:

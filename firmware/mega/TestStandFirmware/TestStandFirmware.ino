@@ -139,16 +139,12 @@ static const float CURRENT_GAIN_PUMP   = 0.033f;
 static const float CURRENT_GAIN_COMP   = 0.033f;
 static const float CURRENT_OFFSET_AC_V = 0.0f;
 
-// --- AC mains power (input-side energy, for efficiency) ---
-// The SCT-013 clamps measure RMS current only; we ASSUME line voltage and a
-// motor power factor to get watts. >>> VERIFY both with a meter before trusting
-// the efficiency number; a true-power meter (PZEM-004T) removes both guesses.
-static const float MAINS_V_ASSUMED   = 120.0f;   // US single-phase
-static const float COMP_POWER_FACTOR = 0.75f;    // >>> measure: comp motor PF ~0.6-0.85
-static const float PUMP_POWER_FACTOR = 0.75f;    // >>> measure: pump motor PF ~0.6-0.85
+// --- SCT-013 noise floor ---
 // RMS of a zero-mean noisy signal is never 0; the SCT reads ~0.7 A with the
-// load OFF. Deadband below this floor so phantom current/power stays out of the
-// efficiency integral. >>> RE-MEASURE per channel after final wiring/shielding.
+// load OFF. Deadband below this floor so the phantom current stays out of the
+// transmitted reading (and therefore out of the Pi's power/efficiency integral).
+// Power itself (V*I*PF) is computed Pi-side; the Mega only cleans the current.
+// >>> RE-MEASURE per channel after final wiring/shielding.
 static const float SCT_NOISE_FLOOR_A = 1.0f;
 
 // --- Alt encoder ---
@@ -367,14 +363,10 @@ struct Sensors {
     // Electrical (output side)
     float v_alt_V;           // a9 -- the controlled variable
     float i_load_A;          // a10
-    // Electrical (input side, for efficiency calc)
+    // Electrical (input side, for efficiency calc). Current only -- the Pi
+    // derives power (V*I*PF) from these; see teststand_logger.py.
     float i_pump_A;          // a14, SCT-013 around pump mains
     float i_comp_A;          // a15, SCT-013 around compressor mains
-    // Mains power, derived from RMS current + assumed 120V / PF (see config).
-    float s_pump_VA;         // apparent: 120 * I
-    float p_pump_W;          // real: 120 * I * PF
-    float s_comp_VA;
-    float p_comp_W;
     // Water valve position feedback (white-wire OC PWM, %)
     float water_valve_fb_pct;
     // Diagnostics
@@ -763,17 +755,12 @@ void sample_sensors() {
     update_rms(g_rms_comp, PIN_I_COMP);
     float i_pump = rms_to_amps(g_rms_pump, CURRENT_GAIN_PUMP);
     float i_comp = rms_to_amps(g_rms_comp, CURRENT_GAIN_COMP);
-    // Deadband the RMS noise floor so an OFF load reads true zero (keeps phantom
-    // VA/W out of telemetry and the efficiency integral).
+    // Deadband the RMS noise floor so an OFF load reads true zero (keeps the
+    // phantom out of the transmitted current and the Pi's energy integral).
     if (i_pump < SCT_NOISE_FLOOR_A) i_pump = 0.0f;
     if (i_comp < SCT_NOISE_FLOOR_A) i_comp = 0.0f;
-    g_sen.i_pump_A   = i_pump;
-    g_sen.i_comp_A   = i_comp;
-    // Assumed-voltage power: apparent (VA) is V*I; real (W) applies motor PF.
-    g_sen.s_pump_VA  = MAINS_V_ASSUMED * i_pump;
-    g_sen.p_pump_W   = g_sen.s_pump_VA * PUMP_POWER_FACTOR;
-    g_sen.s_comp_VA  = MAINS_V_ASSUMED * i_comp;
-    g_sen.p_comp_W   = g_sen.s_comp_VA * COMP_POWER_FACTOR;
+    g_sen.i_pump_A = i_pump;
+    g_sen.i_comp_A = i_comp;
 
     // --- MS5837 (hydrostatic, depth) ---
     // Skipped entirely on an air-only bench (HAVE_DEPTH_SENSOR=false) so a
@@ -1499,7 +1486,7 @@ void process_serial_rx() {
 }
 
 void send_telemetry() {
-    char buf[384];
+    char buf[320];
     snprintf(buf, sizeof(buf),
         "{\"t\":%lu,\"st\":%u,\"f\":%u,\"o\":%u,"
         "\"va\":%ld,\"il\":%ld,"
@@ -1507,7 +1494,6 @@ void send_telemetry() {
         "\"ph\":%ld,\"tw\":%ld,\"d\":%ld,"
         "\"ra\":%ld,\"rw\":%ld,"
         "\"ip\":%ld,\"ic\":%ld,"
-        "\"sp\":%ld,\"pp\":%ld,\"sc\":%ld,\"pc\":%ld,"
         "\"wvp\":%ld,\"wfb\":%ld,\"aph\":%ld,"
         "\"es\":%u,\"arm\":%u,\"ma\":%u,\"mw\":%u,\"ch\":%u,\"di\":%u,"
         "\"vsp\":%d}",
@@ -1517,7 +1503,6 @@ void send_telemetry() {
         (long)(g_sen.p_hydro_mbar * 10), (long)(g_sen.temp_water_C * 10), (long)(g_sen.depth_cm * 10),
         (long)(g_sen.rpm_alt * 10), (long)(g_sen.rpm_water * 10),
         (long)(g_sen.i_pump_A * 1000), (long)(g_sen.i_comp_A * 1000),
-        (long)g_sen.s_pump_VA, (long)g_sen.p_pump_W, (long)g_sen.s_comp_VA, (long)g_sen.p_comp_W,
         (long)(g_water_valve_cmd_pct * 10), (long)(g_sen.water_valve_fb_pct * 10), (long)(g_air_pulse_cmd_hz * 100),
         (unsigned)(g_in.estop_asserted ? 1 : 0),
         (unsigned)(g_in.arm ? 1 : 0),

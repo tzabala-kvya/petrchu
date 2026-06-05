@@ -49,6 +49,13 @@ LOG_DIR      = "logs"
 # Override via Logger(mains_v=...) if the bench uses a different supply.
 MAINS_V_DEFAULT = 120.0
 
+# Motor power factor. The SCT-013 clamps measure RMS current only, so apparent
+# power is V*I (VA); real power (W) = V*I*PF. Inductive motors run PF ~0.6-0.85.
+# Round-trip efficiency uses REAL input power. >>> MEASURE per motor with a
+# clamp/power meter; these are placeholders. A PZEM-004T would remove the guess.
+PUMP_PF_DEFAULT = 0.75
+COMP_PF_DEFAULT = 0.75
+
 # State name lookup (matches firmware enum in TestStandFirmware.ino)
 STATE_NAMES = {
     0:  "BOOT_SELFTEST",
@@ -106,8 +113,9 @@ CSV_COLUMNS = [
     "estop", "arm", "mode_air", "mode_water", "charge", "discharge",
     # Output side (the controlled variable)
     "v_alt_V", "i_load_A", "power_alt_W",
-    # Input side (efficiency calc)
-    "i_pump_A", "i_comp_A", "power_pump_W", "power_comp_W",
+    # Input side (efficiency calc). _VA = apparent (V*I), _W = real (V*I*PF).
+    "i_pump_A", "i_comp_A",
+    "power_pump_VA", "power_pump_W", "power_comp_VA", "power_comp_W",
     # Pressure
     "p1_vessel_psi", "p2_motor_psi",
     # Water tank (hydrostatic)
@@ -142,10 +150,14 @@ class TelemetryDecoder:
     """Decodes raw Mega JSON into a row dict with derived quantities."""
 
     def __init__(self, session_id: str, test_id: str = "",
-                 mains_v: float = MAINS_V_DEFAULT):
+                 mains_v: float = MAINS_V_DEFAULT,
+                 pump_pf: float = PUMP_PF_DEFAULT,
+                 comp_pf: float = COMP_PF_DEFAULT):
         self.session_id = session_id
         self.test_id    = test_id
         self.mains_v    = mains_v
+        self.pump_pf    = pump_pf
+        self.comp_pf    = comp_pf
 
         # State for integrals / derivatives
         self._prev_t_ms        = None
@@ -212,9 +224,13 @@ class TelemetryDecoder:
 
         # --- Power ---
         # Alt output is DC after rectifier; pump/comp are AC RMS.
+        # Apparent (VA) = V*I; real (W) = V*I*PF. Efficiency uses real power, so
+        # energy integrals below run on power_pump/power_comp (the W figures).
         power_alt  = v_alt  * i_load
-        power_pump = i_pump * self.mains_v
-        power_comp = i_comp * self.mains_v
+        s_pump_VA  = i_pump * self.mains_v
+        s_comp_VA  = i_comp * self.mains_v
+        power_pump = s_pump_VA * self.pump_pf
+        power_comp = s_comp_VA * self.comp_pf
 
         # --- Energy integrals (trapezoidal, only between samples) ---
         if self._prev_t_ms is not None and t_ms > self._prev_t_ms:
@@ -280,10 +296,12 @@ class TelemetryDecoder:
             "i_load_A":    round(i_load, 3),
             "power_alt_W": round(power_alt, 2),
 
-            "i_pump_A":     round(i_pump, 3),
-            "i_comp_A":     round(i_comp, 3),
-            "power_pump_W": round(power_pump, 2),
-            "power_comp_W": round(power_comp, 2),
+            "i_pump_A":      round(i_pump, 3),
+            "i_comp_A":      round(i_comp, 3),
+            "power_pump_VA": round(s_pump_VA, 2),
+            "power_pump_W":  round(power_pump, 2),
+            "power_comp_VA": round(s_comp_VA, 2),
+            "power_comp_W":  round(power_comp, 2),
 
             "p1_vessel_psi": round(p1_psi, 2),
             "p2_motor_psi":  round(p2_psi, 2),
@@ -428,13 +446,16 @@ class Logger:
 
     def __init__(self, port: str, baud: int = BAUD_DEFAULT,
                  test_id: str = "", history_len: int = 600,
-                 mains_v: float = MAINS_V_DEFAULT):
+                 mains_v: float = MAINS_V_DEFAULT,
+                 pump_pf: float = PUMP_PF_DEFAULT,
+                 comp_pf: float = COMP_PF_DEFAULT):
         self.session_id = str(uuid.uuid4())
         self.test_id    = test_id
         self.port       = port
         self.baud       = baud
 
-        self._decoder = TelemetryDecoder(self.session_id, test_id, mains_v=mains_v)
+        self._decoder = TelemetryDecoder(self.session_id, test_id, mains_v=mains_v,
+                                         pump_pf=pump_pf, comp_pf=comp_pf)
         self._csv     = CSVWriter(self.session_id)
 
         self._history      = deque(maxlen=history_len)  # 60 s @ 10 Hz default
@@ -557,10 +578,15 @@ def main():
     p.add_argument("--test-id", default="")
     p.add_argument("--mains-v", type=float, default=MAINS_V_DEFAULT,
                    help="AC mains voltage assumed for pump/comp power calc")
+    p.add_argument("--pump-pf", type=float, default=PUMP_PF_DEFAULT,
+                   help="Pump motor power factor (real W = V*I*PF)")
+    p.add_argument("--comp-pf", type=float, default=COMP_PF_DEFAULT,
+                   help="Compressor motor power factor (real W = V*I*PF)")
     args = p.parse_args()
 
     log = Logger(port=args.port, baud=args.baud,
-                 test_id=args.test_id, mains_v=args.mains_v)
+                 test_id=args.test_id, mains_v=args.mains_v,
+                 pump_pf=args.pump_pf, comp_pf=args.comp_pf)
     log.start()
     try:
         while True:

@@ -50,7 +50,9 @@ if "serial" not in sys.modules:
 
 # Safe to import the UI now (which pulls in teststand_logger)
 from teststand_ui import TestStandUI
-from teststand_logger import STATE_NAMES
+from teststand_logger import (
+    STATE_NAMES, MAINS_V_DEFAULT, PUMP_PF_DEFAULT, COMP_PF_DEFAULT,
+)
 
 
 # =========================================================================
@@ -296,11 +298,14 @@ class FakeLogger:
                 p2 = max(0.0, 22.0 + 8.0 * wob)
             depth_cm = max(5.0, 45.0 - elapsed * 0.5)
 
-        # Power calcs (mains assumed 120 V)
-        mains_v = 120.0
+        # Power calcs. Mirror the real path (teststand_logger): apparent = V*I,
+        # real = V*I*PF, efficiency runs on real power.
+        mains_v = MAINS_V_DEFAULT
         power_alt  = v_alt * i_load
-        power_pump = i_pump * mains_v
-        power_comp = i_comp * mains_v
+        s_pump_VA  = i_pump * mains_v
+        s_comp_VA  = i_comp * mains_v
+        power_pump = s_pump_VA * PUMP_PF_DEFAULT
+        power_comp = s_comp_VA * COMP_PF_DEFAULT
 
         # Energy integrals (10 Hz tick ~ 0.1 s)
         self._energy_alt_J  += power_alt  * 0.1
@@ -337,10 +342,12 @@ class FakeLogger:
             "i_load_A":    round(i_load, 3),
             "power_alt_W": round(power_alt, 2),
 
-            "i_pump_A":     round(i_pump, 3),
-            "i_comp_A":     round(i_comp, 3),
-            "power_pump_W": round(power_pump, 2),
-            "power_comp_W": round(power_comp, 2),
+            "i_pump_A":      round(i_pump, 3),
+            "i_comp_A":      round(i_comp, 3),
+            "power_pump_VA": round(s_pump_VA, 2),
+            "power_pump_W":  round(power_pump, 2),
+            "power_comp_VA": round(s_comp_VA, 2),
+            "power_comp_W":  round(power_comp, 2),
 
             "p1_vessel_psi": round(p1, 2),
             "p2_motor_psi":  round(p2, 2),

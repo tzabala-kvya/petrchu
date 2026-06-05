@@ -37,6 +37,7 @@ from matplotlib.figure import Figure
 from teststand_logger import (
     Logger, STATE_NAMES, CHARGE_STATES, DISCHARGE_STATES,
     ui_mode_from_row,
+    MAINS_V_DEFAULT, PUMP_PF_DEFAULT, COMP_PF_DEFAULT,
 )
 
 # =========================================================================
@@ -763,15 +764,20 @@ def main():
     p.add_argument("--port", default="/dev/ttyACM0", help="Serial port")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--test-id", default="")
-    p.add_argument("--mains-v", type=float, default=120.0,
+    p.add_argument("--mains-v", type=float, default=MAINS_V_DEFAULT,
                    help="AC mains voltage assumed for pump/comp power calc")
+    p.add_argument("--pump-pf", type=float, default=PUMP_PF_DEFAULT,
+                   help="Pump motor power factor (real W = V*I*PF)")
+    p.add_argument("--comp-pf", type=float, default=COMP_PF_DEFAULT,
+                   help="Compressor motor power factor (real W = V*I*PF)")
     p.add_argument("--fullscreen", action="store_true",
                    help="Launch full-screen (for HDMI kiosk demo)")
     args = p.parse_args()
 
     try:
         logger = Logger(port=args.port, baud=args.baud,
-                        test_id=args.test_id, mains_v=args.mains_v)
+                        test_id=args.test_id, mains_v=args.mains_v,
+                        pump_pf=args.pump_pf, comp_pf=args.comp_pf)
     except Exception as e:
         print(f"Failed to open serial port {args.port}: {e}", file=sys.stderr)
         sys.exit(1)

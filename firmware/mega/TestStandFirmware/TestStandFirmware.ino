@@ -104,6 +104,11 @@ static const uint8_t PIN_I_COMP    = A15;
 
 // --- Optional channel toggles ---
 static const bool HAVE_WATER_HALL = false;   // water-side bevel pinion hall
+// HAVE_DEPTH_SENSOR: set false on an air-only bench where the MS5837 isn't
+// wired. When false: skip the I2C read (no F_I2C_TIMEOUT), drop the depth
+// requirement from selftest (no F_SELFTEST from a missing sensor), and disable
+// the depth-dependent pump interlocks (cavitation fault + tank-full auto-stop).
+static const bool HAVE_DEPTH_SENSOR = false;
 
 // ============================================================================
 // 2. CALIBRATION CONSTANTS
@@ -133,6 +138,18 @@ static const float CURRENT_OFFSET_DC_V = 2.5f;   // fallback if EEPROM uninitial
 static const float CURRENT_GAIN_PUMP   = 0.033f;
 static const float CURRENT_GAIN_COMP   = 0.033f;
 static const float CURRENT_OFFSET_AC_V = 0.0f;
+
+// --- AC mains power (input-side energy, for efficiency) ---
+// The SCT-013 clamps measure RMS current only; we ASSUME line voltage and a
+// motor power factor to get watts. >>> VERIFY both with a meter before trusting
+// the efficiency number; a true-power meter (PZEM-004T) removes both guesses.
+static const float MAINS_V_ASSUMED   = 120.0f;   // US single-phase
+static const float COMP_POWER_FACTOR = 0.75f;    // >>> measure: comp motor PF ~0.6-0.85
+static const float PUMP_POWER_FACTOR = 0.75f;    // >>> measure: pump motor PF ~0.6-0.85
+// RMS of a zero-mean noisy signal is never 0; the SCT reads ~0.7 A with the
+// load OFF. Deadband below this floor so phantom current/power stays out of the
+// efficiency integral. >>> RE-MEASURE per channel after final wiring/shielding.
+static const float SCT_NOISE_FLOOR_A = 1.0f;
 
 // --- Alt encoder ---
 static const uint8_t ALT_ENCODER_CPR = 4;
@@ -353,6 +370,11 @@ struct Sensors {
     // Electrical (input side, for efficiency calc)
     float i_pump_A;          // a14, SCT-013 around pump mains
     float i_comp_A;          // a15, SCT-013 around compressor mains
+    // Mains power, derived from RMS current + assumed 120V / PF (see config).
+    float s_pump_VA;         // apparent: 120 * I
+    float p_pump_W;          // real: 120 * I * PF
+    float s_comp_VA;
+    float p_comp_W;
     // Water valve position feedback (white-wire OC PWM, %)
     float water_valve_fb_pct;
     // Diagnostics
@@ -451,6 +473,14 @@ struct RmsState {
 };
 static RmsState g_rms_pump = {};
 static RmsState g_rms_comp = {};
+
+// Per-switch debouncer state. Defined here (before the first function) so the
+// Arduino auto-generated prototype for debounce_switch() can see the type.
+struct SwDebounce {
+    uint8_t       last_raw;
+    uint8_t       stable;
+    unsigned long edge_ms;
+};
 
 // Air pulser timing (lifted from mosfet_fusch_pid_uno)
 static unsigned long g_air_period_ms       = 0;
@@ -731,18 +761,33 @@ void sample_sensors() {
     // 100-sample (1 second) window; RMS computed over the window each pass.
     update_rms(g_rms_pump, PIN_I_PUMP);
     update_rms(g_rms_comp, PIN_I_COMP);
-    g_sen.i_pump_A = rms_to_amps(g_rms_pump, CURRENT_GAIN_PUMP);
-    g_sen.i_comp_A = rms_to_amps(g_rms_comp, CURRENT_GAIN_COMP);
+    float i_pump = rms_to_amps(g_rms_pump, CURRENT_GAIN_PUMP);
+    float i_comp = rms_to_amps(g_rms_comp, CURRENT_GAIN_COMP);
+    // Deadband the RMS noise floor so an OFF load reads true zero (keeps phantom
+    // VA/W out of telemetry and the efficiency integral).
+    if (i_pump < SCT_NOISE_FLOOR_A) i_pump = 0.0f;
+    if (i_comp < SCT_NOISE_FLOOR_A) i_comp = 0.0f;
+    g_sen.i_pump_A   = i_pump;
+    g_sen.i_comp_A   = i_comp;
+    // Assumed-voltage power: apparent (VA) is V*I; real (W) applies motor PF.
+    g_sen.s_pump_VA  = MAINS_V_ASSUMED * i_pump;
+    g_sen.p_pump_W   = g_sen.s_pump_VA * PUMP_POWER_FACTOR;
+    g_sen.s_comp_VA  = MAINS_V_ASSUMED * i_comp;
+    g_sen.p_comp_W   = g_sen.s_comp_VA * COMP_POWER_FACTOR;
 
     // --- MS5837 (hydrostatic, depth) ---
-    float mbar, temp_c;
-    if (ms5837_read(mbar, temp_c)) {
-        g_sen.p_hydro_mbar    = mbar;
-        g_sen.temp_water_C    = temp_c;
-        g_sen.depth_cm        = depth_cm_calibrated(mbar);
-        g_sen.i2c_fail_count  = 0;
-    } else if (g_sen.i2c_fail_count < 255) {
-        g_sen.i2c_fail_count++;
+    // Skipped entirely on an air-only bench (HAVE_DEPTH_SENSOR=false) so a
+    // disconnected sensor can't climb i2c_fail_count into F_I2C_TIMEOUT.
+    if (HAVE_DEPTH_SENSOR) {
+        float mbar, temp_c;
+        if (ms5837_read(mbar, temp_c)) {
+            g_sen.p_hydro_mbar    = mbar;
+            g_sen.temp_water_C    = temp_c;
+            g_sen.depth_cm        = depth_cm_calibrated(mbar);
+            g_sen.i2c_fail_count  = 0;
+        } else if (g_sen.i2c_fail_count < 255) {
+            g_sen.i2c_fail_count++;
+        }
     }
 
     // --- Alt RPM (encoder, CPR=4) ---
@@ -770,13 +815,7 @@ void sample_sensors() {
 // 19. DISCRETE INPUT READ (E-stop debounced from ISR, switches polled)
 // ============================================================================
 
-// Per-switch debouncer state.
-struct SwDebounce {
-    uint8_t       last_raw;
-    uint8_t       stable;
-    unsigned long edge_ms;
-};
-
+// Per-switch debouncer state (struct SwDebounce defined up in the types section).
 static SwDebounce g_db_arm = {HIGH, HIGH, 0};
 static SwDebounce g_db_mode_air = {HIGH, HIGH, 0};
 static SwDebounce g_db_mode_water = {HIGH, HIGH, 0};
@@ -856,7 +895,7 @@ void check_fault_conditions() {
 
     // --- F_PUMP_CAVITATION: pump commanded + lower-tank depth below NPSH ---
     const bool pump_on = (g_state == S_CHARGE_WATER || g_state == S_CHARGE_BOTH);
-    if (pump_on && g_sen.depth_cm < P_CAVITATION_DEPTH_CM_MIN) {
+    if (HAVE_DEPTH_SENSOR && pump_on && g_sen.depth_cm < P_CAVITATION_DEPTH_CM_MIN) {
         tr |= F_PUMP_CAVITATION;
     }
 
@@ -1363,7 +1402,7 @@ void commit_outputs() {
     if (g_sen.p1_vessel_psi >= P_VESSEL_CHARGE_TARGET_PSI) {
         comp = false;  // air vessel reached target
     }
-    if (g_sen.depth_cm <= P_TANK_CHARGED_DEPTH_CM) {
+    if (HAVE_DEPTH_SENSOR && g_sen.depth_cm <= P_TANK_CHARGED_DEPTH_CM) {
         pump = false;  // lower tank drained = upper tank full
     }
 
@@ -1460,7 +1499,7 @@ void process_serial_rx() {
 }
 
 void send_telemetry() {
-    char buf[320];
+    char buf[384];
     snprintf(buf, sizeof(buf),
         "{\"t\":%lu,\"st\":%u,\"f\":%u,\"o\":%u,"
         "\"va\":%ld,\"il\":%ld,"
@@ -1468,6 +1507,7 @@ void send_telemetry() {
         "\"ph\":%ld,\"tw\":%ld,\"d\":%ld,"
         "\"ra\":%ld,\"rw\":%ld,"
         "\"ip\":%ld,\"ic\":%ld,"
+        "\"sp\":%ld,\"pp\":%ld,\"sc\":%ld,\"pc\":%ld,"
         "\"wvp\":%ld,\"wfb\":%ld,\"aph\":%ld,"
         "\"es\":%u,\"arm\":%u,\"ma\":%u,\"mw\":%u,\"ch\":%u,\"di\":%u,"
         "\"vsp\":%d}",
@@ -1477,6 +1517,7 @@ void send_telemetry() {
         (long)(g_sen.p_hydro_mbar * 10), (long)(g_sen.temp_water_C * 10), (long)(g_sen.depth_cm * 10),
         (long)(g_sen.rpm_alt * 10), (long)(g_sen.rpm_water * 10),
         (long)(g_sen.i_pump_A * 1000), (long)(g_sen.i_comp_A * 1000),
+        (long)g_sen.s_pump_VA, (long)g_sen.p_pump_W, (long)g_sen.s_comp_VA, (long)g_sen.p_comp_W,
         (long)(g_water_valve_cmd_pct * 10), (long)(g_sen.water_valve_fb_pct * 10), (long)(g_air_pulse_cmd_hz * 100),
         (unsigned)(g_in.estop_asserted ? 1 : 0),
         (unsigned)(g_in.arm ? 1 : 0),
@@ -1499,8 +1540,11 @@ bool run_selftest() {
     if (g_sen.p1_vessel_psi < P_SANITY_LO_PSI ||
         g_sen.p1_vessel_psi > P_SANITY_HI_PSI) return false;
 
-    float m, t;
-    if (!ms5837_read(m, t)) return false;
+    // Depth sensor is part of selftest only when it's supposed to be present.
+    if (HAVE_DEPTH_SENSOR) {
+        float m, t;
+        if (!ms5837_read(m, t)) return false;
+    }
 
     // Visual ack: green LED blink x3
     for (uint8_t i = 0; i < 3; i++) {
@@ -1561,8 +1605,9 @@ void setup() {
     // EEPROM load (atm offset, ACS zero, V setpoint default)
     eeprom_load_all();
 
-    // MS5837 init (must call setModel_02BA -- done inside ms5837_init)
-    ms5837_init();
+    // MS5837 init (must call setModel_02BA -- done inside ms5837_init).
+    // Skipped on an air-only bench so a missing sensor doesn't stall boot.
+    if (HAVE_DEPTH_SENSOR) ms5837_init();
 
     // Watchdog
     wdt_enable(WDTO_250MS);

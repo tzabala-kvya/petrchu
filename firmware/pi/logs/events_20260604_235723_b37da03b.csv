@@ -1,0 +1,2 @@
+timestamp_iso,timestamp_ms,session_id,event_type,detail
+2026-06-05T06:57:34.610+00:00,10337,b37da03b-cce1-495b-93a5-785abb10e3da,STATE_CHANGE,OFF -> ARMED_IDLE

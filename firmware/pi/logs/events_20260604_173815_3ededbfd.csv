@@ -1,0 +1,2 @@
+timestamp_iso,timestamp_ms,session_id,event_type,detail
+2026-06-05T00:38:16.976+00:00,206,3ededbfd-bb7b-4ced-bdd2-5584194b0c5d,FAULT,ESTOP|OVERVOLTAGE|I2C_TIMEOUT|SELFTEST|OVERPRESSURE

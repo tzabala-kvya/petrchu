@@ -56,15 +56,19 @@ static const uint8_t PIN_LED_WHITE  = 44;  // charge active (pump or compressor 
 static const uint8_t PIN_PIEZO      = 42;  // fault tone, brief beep on fault edge
 
 // --- Digital outputs: MOSFET-driven loads ---
-// MOSFET 1 (d45) -> 12V relay coil -> compressor contactor (AC mains).
+// MOSFET 1 (d47) -> 12V relay coil -> compressor contactor (AC mains).
 // MOSFET 2 (d43) -> 12V relay coil -> pump contactor (AC mains).
-// MOSFET 3 (d41) -> air pulse-rate solenoid (PID-modulated, <= MAX_PULSE_HZ).
+// MOSFET 3 (d45) -> air pulse-rate solenoid (PID-modulated, <= MAX_PULSE_HZ).
 // MOSFET 4 (d39) -> air on/off arm solenoid (open during DISCHARGE_AIR/BOTH).
-// All four follow the low-side N-channel pattern from mosfet_test_uno.
-static const uint8_t PIN_MOSFET_COMP_CONT  = 45;  // MOSFET 1
-static const uint8_t PIN_MOSFET_PUMP_CONT  = 43;  // MOSFET 2
-static const uint8_t PIN_MOSFET_AIR_PULSE  = 41;  // MOSFET 3 -- pulse-rate PID drives this
-static const uint8_t PIN_MOSFET_AIR_ARM    = 39;  // MOSFET 4 -- on/off arm
+// MOSFET 5 (d41) -> water on/off shutoff solenoid (series, UPSTREAM of the
+//                   HSH-Flo prop valve; normally closed; opens only during
+//                   water discharge; hard series cutoff redundant to prop valve).
+// All follow the low-side N-channel pattern from mosfet_test_uno.
+static const uint8_t PIN_MOSFET_COMP_CONT     = 47;  // MOSFET 1
+static const uint8_t PIN_MOSFET_PUMP_CONT     = 43;  // MOSFET 2
+static const uint8_t PIN_MOSFET_AIR_PULSE     = 45;  // MOSFET 3 -- pulse-rate PID drives this
+static const uint8_t PIN_MOSFET_AIR_ARM       = 39;  // MOSFET 4 -- on/off arm
+static const uint8_t PIN_MOSFET_WATER_SHUTOFF = 41;  // MOSFET 5 -- water series cutoff
 
 // --- Digital output: water proportional valve drive (PWM -> 0-10V converter) ---
 // PWM-capable on Mega Timer1. Drives the HSH-Flo green wire via a calibrated

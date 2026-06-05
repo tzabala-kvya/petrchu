@@ -66,10 +66,16 @@ static const uint8_t PIN_LED_WHITE  = 44;  // charge active
 static const uint8_t PIN_PIEZO      = 42;
 
 // --- Digital outputs: MOSFETs ---
-static const uint8_t PIN_MOSFET_COMP_CONT = 45;  // M1 -> compressor contactor relay
-static const uint8_t PIN_MOSFET_PUMP_CONT = 43;  // M2 -> pump contactor relay
-static const uint8_t PIN_MOSFET_AIR_PULSE = 41;  // M3 -> air pulse-rate solenoid (PID-modulated)
-static const uint8_t PIN_MOSFET_AIR_ARM   = 39;  // M4 -> air on/off arm solenoid
+static const uint8_t PIN_MOSFET_COMP_CONT     = 47;  // M1 -> compressor contactor relay
+static const uint8_t PIN_MOSFET_PUMP_CONT     = 43;  // M2 -> pump contactor relay
+static const uint8_t PIN_MOSFET_AIR_PULSE     = 45;  // M3 -> air pulse-rate solenoid (PID-modulated)
+static const uint8_t PIN_MOSFET_AIR_ARM       = 39;  // M4 -> air on/off arm solenoid
+static const uint8_t PIN_MOSFET_WATER_SHUTOFF = 41;  // M5 -> water on/off shutoff solenoid
+                                                     //       (series, UPSTREAM of HSH-Flo prop
+                                                     //        valve; normally closed; opens only
+                                                     //        during water discharge as a hard
+                                                     //        series cutoff redundant to the prop
+                                                     //        valve)
 
 // --- Digital output: water prop valve PWM ---
 static const uint8_t PIN_WATER_VALVE_PWM  = 9;   // PWM -> 0-10V converter -> HSH-Flo green
@@ -108,7 +114,7 @@ static const bool HAVE_WATER_HALL = false;   // water-side bevel pinion hall
 // wired. When false: skip the I2C read (no F_I2C_TIMEOUT), drop the depth
 // requirement from selftest (no F_SELFTEST from a missing sensor), and disable
 // the depth-dependent pump interlocks (cavitation fault + tank-full auto-stop).
-static const bool HAVE_DEPTH_SENSOR = false;
+static const bool HAVE_DEPTH_SENSOR = true;
 
 // ============================================================================
 // 2. CALIBRATION CONSTANTS
@@ -520,12 +526,13 @@ static inline void write_pin(uint8_t pin, bool on) {
 // Emergency stop: drive every actuator pin to safe state immediately.
 // Called from E-stop, FAULT, SHUTDOWN, and at boot.
 void immediate_cutoff_all() {
-    write_pin(PIN_MOSFET_COMP_CONT, false);
-    write_pin(PIN_MOSFET_PUMP_CONT, false);
-    write_pin(PIN_MOSFET_AIR_PULSE, false);
-    write_pin(PIN_MOSFET_AIR_ARM,   false);
+    write_pin(PIN_MOSFET_COMP_CONT,     false);
+    write_pin(PIN_MOSFET_PUMP_CONT,     false);
+    write_pin(PIN_MOSFET_AIR_PULSE,     false);
+    write_pin(PIN_MOSFET_AIR_ARM,       false);
+    write_pin(PIN_MOSFET_WATER_SHUTOFF, false);   // slam the series water cutoff closed
     analogWrite(PIN_WATER_VALVE_PWM, 0);   // close water valve (PWM 0 -> 0V command)
-    // Stop the pulser so servicePulser() doesn't re-energize d41 on next tick.
+    // Stop the pulser so servicePulser() doesn't re-energize the air pulse pin on next tick.
     g_air_period_ms       = 0;
     g_air_on_ms           = 0;
     g_air_pulser_on       = false;
@@ -661,9 +668,10 @@ static void serviceAirPulser() {
     }
 }
 
-static void setAirArmSolenoid(bool open) { write_pin(PIN_MOSFET_AIR_ARM,   open); }
-static void setCompressor   (bool on)    { write_pin(PIN_MOSFET_COMP_CONT, on);   }
-static void setPump         (bool on)    { write_pin(PIN_MOSFET_PUMP_CONT, on);   }
+static void setAirArmSolenoid (bool open) { write_pin(PIN_MOSFET_AIR_ARM,       open); }
+static void setWaterShutoff   (bool open) { write_pin(PIN_MOSFET_WATER_SHUTOFF, open); }
+static void setCompressor     (bool on)   { write_pin(PIN_MOSFET_COMP_CONT,     on);   }
+static void setPump           (bool on)   { write_pin(PIN_MOSFET_PUMP_CONT,     on);   }
 
 // ============================================================================
 // 16. MS5837 DRIVER (model = -02BA, must call setModel explicitly)
@@ -1344,7 +1352,7 @@ void servicePidAir(bool active) {
 
 void commit_outputs() {
     // Default: everything off
-    bool comp = false, pump = false, air_arm = false;
+    bool comp = false, pump = false, air_arm = false, water_shutoff = false;
     float water_pct = 0.0f;
     float air_hz    = 0.0f;
 
@@ -1359,11 +1367,13 @@ void commit_outputs() {
         break;
 
     case S_DISCHARGE_WATER:
-        water_pct = g_water_pid_output_pct;
+        water_pct     = g_water_pid_output_pct;
+        water_shutoff = true;   // open series cutoff; prop valve modulates flow
         break;
 
     case S_DISCHARGE_BOTH:
-        water_pct = g_water_pid_output_pct;
+        water_pct     = g_water_pid_output_pct;
+        water_shutoff = true;   // water is always the primary leg in BOTH
         // Dispatch: air arm + pulse only when serviceDispatch() decides air is needed.
         air_arm   = g_dispatch_air_engaged;
         air_hz    = g_dispatch_air_engaged ? g_air_pid_output_hz : 0.0f;
@@ -1393,15 +1403,18 @@ void commit_outputs() {
         pump = false;  // lower tank drained = upper tank full
     }
 
-    // Soft overvoltage: drive V-regulating actuators closed fast
+    // Soft overvoltage: drive V-regulating actuators closed fast. Also slam the
+    // water series cutoff -- it's the hardest stop available on the water leg
+    // and stops flow without waiting on the prop valve's 7-10 s transit.
     if (g_sen.v_alt_V > V_OVERVOLTAGE_SOFT_V) {
-        water_pct = 0.0f;
-        air_hz    = 0.0f;
+        water_pct     = 0.0f;
+        air_hz        = 0.0f;
+        water_shutoff = false;
     }
 
     // ARM off: kill everything (defensive -- state machine should already be OFF)
     if (!g_in.arm) {
-        comp = false; pump = false; air_arm = false;
+        comp = false; pump = false; air_arm = false; water_shutoff = false;
         water_pct = 0.0f; air_hz = 0.0f;
     }
 
@@ -1416,6 +1429,7 @@ void commit_outputs() {
     setCompressor(comp);
     setPump(pump);
     setAirArmSolenoid(air_arm);
+    setWaterShutoff(water_shutoff);
     setWaterValvePct(water_pct);
     setAirPulseHz(air_hz);
 
@@ -1426,6 +1440,7 @@ void commit_outputs() {
     if (air_arm) b |= (1 << 2);
     if (water_pct > 0.5f) b |= (1 << 3);
     if (air_hz    > 0.01f) b |= (1 << 4);
+    if (water_shutoff)    b |= (1 << 5);
     g_outputs_bitmap = b;
 }
 
@@ -1549,7 +1564,7 @@ void setup() {
         PIN_LED_RED, PIN_LED_GREEN, PIN_LED_YELLOW, PIN_LED_BLUE, PIN_LED_WHITE,
         PIN_PIEZO,
         PIN_MOSFET_COMP_CONT, PIN_MOSFET_PUMP_CONT,
-        PIN_MOSFET_AIR_PULSE, PIN_MOSFET_AIR_ARM,
+        PIN_MOSFET_AIR_PULSE, PIN_MOSFET_AIR_ARM, PIN_MOSFET_WATER_SHUTOFF,
         PIN_WATER_VALVE_PWM
     };
     for (uint8_t i = 0; i < sizeof(outs); i++) {
